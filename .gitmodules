@@ -1,0 +1,40 @@
+[submodule "metagraph/external-libraries/sdsl-lite"]
+	path = metagraph/external-libraries/sdsl-lite
+	url = https://github.com/hmusta/sdsl-lite.git
+	ignore = untracked
+[submodule "metagraph/external-libraries/hopscotch-map"]
+	path = metagraph/external-libraries/hopscotch-map
+	url = https://github.com/Tessil/hopscotch-map.git
+[submodule "metagraph/external-libraries/ips4o"]
+	path = metagraph/external-libraries/ips4o
+	url = https://github.com/SaschaWitt/ips4o.git
+[submodule "metagraph/external-libraries/eigen"]
+	path = metagraph/external-libraries/eigen
+	url = https://github.com/eigenteam/eigen-git-mirror.git
+[submodule "metagraph/external-libraries/asio"]
+	path = metagraph/external-libraries/asio
+	url = https://github.com/chriskohlhoff/asio.git
+[submodule "metagraph/external-libraries/jsoncpp"]
+	path = metagraph/external-libraries/jsoncpp
+	url = https://github.com/open-source-parsers/jsoncpp.git
+[submodule "metagraph/external-libraries/cpp_progress_bar"]
+	path = metagraph/external-libraries/cpp_progress_bar
+	url = https://github.com/karasikov/cpp_progress_bar
+[submodule "metagraph/external-libraries/DYNAMIC"]
+	path = metagraph/external-libraries/DYNAMIC
+	url = https://github.com/karasikov/DYNAMIC.git
+[submodule "metagraph/external-libraries/spdlog"]
+	path = metagraph/external-libraries/spdlog
+	url = https://github.com/gabime/spdlog
+[submodule "metagraph/external-libraries/zlib"]
+	path = metagraph/external-libraries/zlib
+	url = https://github.com/cloudflare/zlib
+[submodule "metagraph/external-libraries/Simple-Web-Server"]
+	path = metagraph/external-libraries/Simple-Web-Server
+	url = https://gitlab.com/eidheim/Simple-Web-Server.git
+[submodule "metagraph/external-libraries/simde-no-tests"]
+	path = metagraph/external-libraries/simde-no-tests
+	url = https://github.com/simd-everywhere/simde-no-tests
+[submodule "metagraph/external-libraries/htslib"]
+	path = metagraph/external-libraries/htslib
+	url = https://github.com/samtools/htslib
