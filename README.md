@@ -23,9 +23,8 @@ Unlike the full MetaGraph suite, which supports various graph annotations and re
 git clone --recursive https://github.com/tracywong117/build_BRWT.git
 cd build_brwt
 git submodule update --init --recursive
-cd metagraph
-cmake .
-make -j$(nproc)
+cmake -S metagraph -B build
+cmake --build build -j$(nproc)
 ```
 This will produce a single executable named `metagraph`.
 
