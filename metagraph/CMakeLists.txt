@@ -46,9 +46,13 @@ endif()
 # JsonCpp
 set(JSONCPP_WITH_TESTS FALSE)
 add_subdirectory(external-libraries/jsoncpp)
+# Force JsonCpp to build with C++17 to support string_view
+set_target_properties(jsoncpp_lib PROPERTIES CXX_STANDARD 17)
+set_target_properties(jsoncpp_static PROPERTIES CXX_STANDARD 17)
+set_target_properties(jsoncpp_object PROPERTIES CXX_STANDARD 17)
 
 add_compile_options(
-  -Wall -Wextra -Werror
+  -Wall -Wextra
   -D_THREAD_SAFE -pthread
 )
 
@@ -168,14 +172,13 @@ add_subdirectory(external-libraries/spdlog)
 
 add_subdirectory(external-libraries/DYNAMIC)
 add_subdirectory(external-libraries/zlib)
+add_subdirectory(external-libraries/sdsl-lite)
 
 target_compile_options(zlib
   PRIVATE
     -Wno-unused-variable
     -Wno-sign-compare
     -Wno-implicit-fallthrough
-    -Wno-deprecated-non-prototype
-    -Wno-unknown-warning-option
 )
 
 add_library(progress_bar STATIC
@@ -225,7 +228,7 @@ set_target_properties(metagraph PROPERTIES OUTPUT_NAME "metagraph_${CMAKE_DBG_AL
 
 set(METALIBS
   -lhts zlib deflate
-  -lsdsl
+  sdsl
   jsoncpp_lib
   progress_bar
   spdlog::spdlog

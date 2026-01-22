@@ -3,7 +3,7 @@ import os
 import sys
 import shutil
 
-METAGRAPH_BIN = "../metagraph/metagraph" # Default assumption
+METAGRAPH_BIN = "../build/metagraph" # Default assumption
 GEN_VECTORS_BIN = "./gen_sdsl_vectors"
 
 def run_command(cmd):
