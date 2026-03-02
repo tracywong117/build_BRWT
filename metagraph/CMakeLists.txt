@@ -227,7 +227,7 @@ add_executable(metagraph "src/main.cpp")
 set_target_properties(metagraph PROPERTIES OUTPUT_NAME "metagraph_${CMAKE_DBG_ALPHABET}")
 
 set(METALIBS
-  -lhts zlib deflate
+  HTSLIB zlib deflate
   sdsl
   jsoncpp_lib
   progress_bar

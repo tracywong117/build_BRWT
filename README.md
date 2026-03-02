@@ -17,12 +17,19 @@ Unlike the full MetaGraph suite, which supports various graph annotations and re
 - CMake >= 3.19
 - GCC (supporting C++17) or Clang
 - Zlib
+- Boost (development libraries)
+- Autoconf, Automake (for building dependencies)
+
+On Ubuntu/Debian, you can install these with:
+```bash
+sudo apt-get install build-essential cmake zlib1g-dev libboost-all-dev autoconf automake libtool libdeflate-dev
+```
 
 ### Compile
 ```bash
 git clone --recursive https://github.com/tracywong117/build_BRWT.git
 cd build_BRWT
-cmake -S metagraph -B build
+cmake -S metagraph -B build -DCMAKE_POLICY_VERSION_MINIMUM=3.5
 cmake --build build -j$(nproc)
 ```
 This will produce a single executable named `metagraph` in the folder `build`.
@@ -32,7 +39,7 @@ This will produce a single executable named `metagraph` in the folder `build`.
 ### 1. Build a BRWT
 Construct a BRWT from a directory of column annotations.
 ```bash
-./metagraph build <annotation_dir> <prefix> <output_file> [options]
+./metagraph build <annotationDir> <annotationFilePrefix> <outputFile> [tmpDir] [--file_list <fileList>] [--threads <num_threads>] [--linkage_k <k>] [--linkage_seed <seed>] [--linkage_trivial]
 ```
 - `<annotation_dir>`: Directory containing input files.
 - `<prefix>`: Prefix of files to include.
