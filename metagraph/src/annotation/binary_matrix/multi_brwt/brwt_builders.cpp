@@ -267,6 +267,9 @@ BRWT BRWTBottomUpBuilder::build(
 
     std::vector<bool> done(linkage.size(), false);
     std::mutex done_mu;
+    std::condition_variable done_cond;
+
+    std::vector<BRWT> leaf_nodes;
 
     ProgressBar progress_bar(linkage.size(), "Building BRWT",
                              std::cerr, !common::get_verbose());
@@ -283,10 +286,14 @@ BRWT BRWTBottomUpBuilder::build(
         node.nonzero_rows_ = std::make_unique<bit_vector_smart>(
                                 column->convert_to<bit_vector_smart>());
 
-        dump_node(std::move(node), i);
-
-        std::unique_lock<std::mutex> lock(done_mu);
-        done[i] = true;
+        {
+            std::unique_lock<std::mutex> lock(done_mu);
+            if (i >= leaf_nodes.size())
+                leaf_nodes.resize(i + 1);
+            leaf_nodes[i] = std::move(node);
+            done[i] = true;
+        }
+        done_cond.notify_all();
 
         if (!num_rows)
             num_rows = size;
@@ -306,8 +313,6 @@ BRWT BRWTBottomUpBuilder::build(
             exit(1);
         }
     }
-
-    std::condition_variable done_cond;
 
     num_nodes_parallel = std::min(num_nodes_parallel, done.size());
     // initialize buffers for merging columns
@@ -339,8 +344,12 @@ BRWT BRWTBottomUpBuilder::build(
             {
                 std::unique_lock<std::mutex> lock(done_mu);
                 done_cond.wait(lock, [&]() { return done[j]; });
+                if (j < num_leaves) {
+                    children[r] = std::move(leaf_nodes[j]);
+                } else {
+                    children[r] = get_node(j);
+                }
             }
-            children[r] = get_node(j);
         }
 
         // merge submatrices
@@ -361,7 +370,7 @@ BRWT BRWTBottomUpBuilder::build(
 
         // compute column assignments for the parent
         for (size_t j : linkage[i]) {
-            if (stored_columns[j].empty()) {
+            if (j < num_leaves) {
                 // the child j is a leaf
                 stored_columns[i].push_back(j);
             } else {
@@ -388,7 +397,9 @@ BRWT BRWTBottomUpBuilder::build(
         ++progress_bar;
     }
 
+    leaf_nodes.clear();
     buffers.clear();
+
 
     // All submatrices must be merged into one
     if (stored_columns.back().size() != num_leaves) {

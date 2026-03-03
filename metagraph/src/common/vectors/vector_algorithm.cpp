@@ -246,12 +246,12 @@ void compute_or(const std::vector<const bit_vector *> &columns,
                 } else {
                     assert((begin & 0x3F) == 0);
 
-                    uint64_t i;
-                    for (i = begin; i + 64 <= end; i += 64) {
-                        result->data()[i / 64] |= col_ptr->get_int(i, 64);
+                    uint64_t *res_data = result->data();
+                    for (uint64_t i = begin; i + 64 <= end; i += 64) {
+                        res_data[i >> 6] |= col_ptr->get_int(i, 64);
                     }
                     if (i < end)
-                        result->data()[i / 64] |= col_ptr->get_int(i, end - i);
+                        res_data[i >> 6] |= col_ptr->get_int(i, end - i);
                 }
             }
 

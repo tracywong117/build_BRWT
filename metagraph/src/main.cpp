@@ -170,6 +170,14 @@ void BM_BRWTLinkageMatrix_streaming(const std::string& folder_path,
     if (file_paths.empty())
         throw std::runtime_error("No files found.");
 
+    if (linkage_trivial) {
+        logger->info("Computing trivial linkage matrix for {} columns.", file_paths.size());
+        LinkageMatrix linkage_matrix = annot::matrix::agglomerative_linkage_trivial(file_paths.size());
+        std::ofstream out(linkage_file);
+        out << linkage_matrix.format(CSVFormat) << std::endl;
+        return;
+    }
+
     // Determine column length from first file
     // for bit vector file
     // std::ifstream first_file(file_paths[0], std::ios::binary | std::ios::ate);
@@ -241,9 +249,7 @@ void BM_BRWTLinkageMatrix_streaming(const std::string& folder_path,
     // Compute linkage matrix (assuming your original code here)
     logger->info("Computing linkage matrix for {} columns.", subcolumns.size());
     LinkageMatrix linkage_matrix;
-    if (linkage_trivial) {
-        linkage_matrix = annot::matrix::agglomerative_linkage_trivial(subcolumns.size());
-    } else if (linkage_k > 0) {
+    if (linkage_k > 0) {
         linkage_matrix = annot::matrix::agglomerative_greedy_linkage_k(std::move(subcolumns),
                                                                        get_num_threads(), linkage_k, linkage_seed);
     } else {
