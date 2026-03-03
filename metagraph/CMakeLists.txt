@@ -10,6 +10,14 @@ project(MetaGraph
   DESCRIPTION "A tool for scalable construction of annotated genome graphs and sequence-to-graph alignment"
 )
 
+option(BUILD_STATIC "Build a static binary" OFF)
+
+if(BUILD_STATIC)
+  set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build static libraries" FORCE)
+  set(OPENSSL_USE_STATIC_LIBS TRUE)
+  set(Boost_USE_STATIC_LIBS ON)
+endif()
+
 add_definitions(-DVERSION="${VERSION}")
 include(CheckFunctionExists)
 include(CheckLibraryExists)
@@ -47,9 +55,15 @@ endif()
 set(JSONCPP_WITH_TESTS FALSE)
 add_subdirectory(external-libraries/jsoncpp)
 # Force JsonCpp to build with C++17 to support string_view
-set_target_properties(jsoncpp_lib PROPERTIES CXX_STANDARD 17)
-set_target_properties(jsoncpp_static PROPERTIES CXX_STANDARD 17)
-set_target_properties(jsoncpp_object PROPERTIES CXX_STANDARD 17)
+if(TARGET jsoncpp_lib)
+  set_target_properties(jsoncpp_lib PROPERTIES CXX_STANDARD 17)
+endif()
+if(TARGET jsoncpp_static)
+  set_target_properties(jsoncpp_static PROPERTIES CXX_STANDARD 17)
+endif()
+if(TARGET jsoncpp_object)
+  set_target_properties(jsoncpp_object PROPERTIES CXX_STANDARD 17)
+endif()
 
 add_compile_options(
   -Wall -Wextra
@@ -134,6 +148,7 @@ include_directories(
   external-libraries/cpp_progress_bar
   external-libraries/spdlog/include
   external-libraries/zlib
+  external-libraries/jsoncpp/include
   ${PROJECT_SOURCE_DIR}/src
 )
 
@@ -188,9 +203,14 @@ add_library(progress_bar STATIC
 
 
 # Build HTSLIB using custom target (simplification)
+set(HTSLIB_CONFIGURE_FLAGS --disable-libcurl --disable-bz2 --disable-lzma)
+if(BUILD_STATIC)
+  list(APPEND HTSLIB_CONFIGURE_FLAGS --without-openssl)
+endif()
+
 add_custom_target(HTSLIB_BUILD
   COMMAND autoreconf -i
-  COMMAND ./configure --disable-libcurl --disable-bz2 --disable-lzma
+  COMMAND ./configure ${HTSLIB_CONFIGURE_FLAGS}
   COMMAND ${CMAKE_MAKE_PROGRAM}
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/external-libraries/htslib
   COMMENT "Building HTSLib"
@@ -226,10 +246,16 @@ add_dependencies(metagraph-core HTSLIB)
 add_executable(metagraph "src/main.cpp")
 set_target_properties(metagraph PROPERTIES OUTPUT_NAME "metagraph_${CMAKE_DBG_ALPHABET}")
 
+if(BUILD_STATIC)
+  set(JSONCPP_LIB jsoncpp_static)
+else()
+  set(JSONCPP_LIB jsoncpp_lib)
+endif()
+
 set(METALIBS
   HTSLIB zlib deflate
   sdsl
-  jsoncpp_lib
+  ${JSONCPP_LIB}
   progress_bar
   spdlog::spdlog
   XXSDS_DYNAMIC
@@ -247,9 +273,14 @@ endif()
 # Static build on Linux (simplified)
 # Assuming dynamic link is fine unless specified, keeping original logic for consistency
 if(BUILD_STATIC AND NOT APPLE)
-   set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static -static-libstdc++ -static-libgcc")
-   find_package(OpenSSL REQUIRED)
-   list(APPEND METALIBS -lssl -lcrypto -lgomp -lrt -ldl -Wl,--whole-archive -lpthread -Wl,--no-whole-archive)
+   set(USE_OPENSSL OFF CACHE BOOL "Disable SSL in Simple-Web-Server" FORCE)
+   
+   # Use absolute paths for static libs
+   list(APPEND METALIBS "/usr/lib/x86_64-linux-gnu/libssl.a" "/usr/lib/x86_64-linux-gnu/libcrypto.a" "/usr/lib/gcc/x86_64-linux-gnu/9/libgomp.a" -lrt -ldl)
+   
+   target_link_options(metagraph PRIVATE "-static" "-static-libstdc++" "-static-libgcc")
+   # Ensure all symbols are bundled
+   list(APPEND METALIBS -Wl,--whole-archive -lpthread -Wl,--no-whole-archive)
 endif()
 
 # Checking for filesystem
@@ -270,6 +301,7 @@ endif()
 target_link_libraries(metagraph-core ${METALIBS})
 
 # Simple Web Server
+set(USE_OPENSSL OFF CACHE BOOL "Disable SSL in Simple-Web-Server" FORCE)
 add_subdirectory(external-libraries/Simple-Web-Server)
 target_link_libraries(metagraph-cli PUBLIC metagraph-core simple-web-server)
 

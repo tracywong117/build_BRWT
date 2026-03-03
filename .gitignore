@@ -44,3 +44,4 @@ external-libraries*
 build/
 benchmark_data/
 *.gemini*
+build_static/

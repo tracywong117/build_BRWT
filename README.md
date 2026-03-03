@@ -22,7 +22,7 @@ Unlike the full MetaGraph suite, which supports various graph annotations and re
 
 On Ubuntu/Debian, you can install these with:
 ```bash
-sudo apt-get install build-essential cmake zlib1g-dev libboost-all-dev autoconf automake libtool libdeflate-dev
+sudo apt-get install build-essential cmake zlib1g-dev libboost-all-dev autoconf automake libtool libdeflate-dev libssl-dev
 ```
 
 ### Compile
@@ -33,6 +33,14 @@ cmake -S metagraph -B build -DCMAKE_POLICY_VERSION_MINIMUM=3.5
 cmake --build build -j$(nproc)
 ```
 This will produce a single executable named `metagraph` in the folder `build`.
+
+### Static Build (Portable Binary)
+To build a static binary that can be copied to other Linux machines without worrying about library dependencies:
+```bash
+cmake -S metagraph -B build_static -DBUILD_STATIC=ON
+cmake --build build_static -j$(nproc)
+```
+**Note:** The resulting binary will be self-contained and will not require any of the prerequisites to be installed on the destination machine. All dependencies are bundled during the build process.
 
 ## Usage
 
