@@ -12,6 +12,9 @@ project(MetaGraph
 
 option(BUILD_STATIC "Build a static binary" OFF)
 
+set(SRC_DIR "src")
+message(STATUS "Building using source directory: ${SRC_DIR}")
+
 if(BUILD_STATIC)
   set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build static libraries" FORCE)
   set(OPENSSL_USE_STATIC_LIBS TRUE)
@@ -149,7 +152,7 @@ include_directories(
   external-libraries/spdlog/include
   external-libraries/zlib
   external-libraries/jsoncpp/include
-  ${PROJECT_SOURCE_DIR}/src
+  ${PROJECT_SOURCE_DIR}/${SRC_DIR}
 )
 
 include_directories(
@@ -226,7 +229,7 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/external-libraries/htslib)
 
 # Gather source files
 file(GLOB_RECURSE metagraph_core_files
-  "src/*.cpp"
+  "${SRC_DIR}/*.cpp"
 )
 
 # Exclude main and unused
@@ -235,15 +238,15 @@ list(FILTER metagraph_core_files EXCLUDE REGEX ".*main.cpp")
 
 # Split CLI files
 set(metagraph_cli_files ${metagraph_core_files})
-list(FILTER metagraph_cli_files INCLUDE REGEX "src/cli/.*")
-list(FILTER metagraph_core_files EXCLUDE REGEX "src/cli/.*")
+list(FILTER metagraph_cli_files INCLUDE REGEX "${SRC_DIR}/cli/.*")
+list(FILTER metagraph_core_files EXCLUDE REGEX "${SRC_DIR}/cli/.*")
 
 add_library(metagraph-core STATIC ${metagraph_core_files})
 add_library(metagraph-cli STATIC ${metagraph_cli_files})
 
 add_dependencies(metagraph-core HTSLIB)
 
-add_executable(metagraph "src/main.cpp")
+add_executable(metagraph "${SRC_DIR}/main.cpp")
 set_target_properties(metagraph PROPERTIES OUTPUT_NAME "metagraph_${CMAKE_DBG_ALPHABET}")
 
 if(BUILD_STATIC)
@@ -317,7 +320,7 @@ add_custom_target(link_target ALL
 add_dependencies(metagraph link_target)
 
 # Install
-file(GLOB_RECURSE header_files "src/*.hpp")
+file(GLOB_RECURSE header_files "${SRC_DIR}/*.hpp")
 install(TARGETS metagraph-core DESTINATION lib)
 install(FILES ${header_files} DESTINATION include/metagraph)
 install(TARGETS metagraph DESTINATION bin)

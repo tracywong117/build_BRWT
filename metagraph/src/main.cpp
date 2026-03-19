@@ -432,12 +432,12 @@ std::vector<std::vector<uint64_t>> parse_linkage_matrix(const std::string& filen
 
 // Load all sdsl::sd_vector<> from files in a folder with a callback
 // for sd_vector file
-bool load_columns_from_folder_callback(
-        const std::string& folder_path,
-        const std::string& file_list,
-        const std::function<void(uint64_t, const std::string&, std::unique_ptr<bit_vector_stat>&&)>& callback,
-        size_t num_threads,
-        const std::string& prefix) {
+bool load_columns_from_folder_callback(const std::string& folder_path,
+                                       const std::string& file_list,
+                                       const std::function<void(uint64_t, const std::string&,
+                                                                std::unique_ptr<bit_vector>&&)>& callback,
+                                       size_t num_threads,
+                                       const std::string& prefix) {
     namespace fs = std::filesystem;
 
     // Find all files in the folder with the given prefix or from file_list
@@ -591,19 +591,46 @@ void build_BRWT(const std::string columns_folder_path,
 
     std::mutex mu; // Mutex for thread-safe access
     std::vector<std::pair<uint64_t, std::string>> column_names; // Store column index and label
+
+    // Pre-calculate stored_columns needed for assembly
+    size_t num_leaves = 0;
+    for (size_t i = 0; i < linkage.size(); ++i) {
+        if (linkage[i].empty()) num_leaves++;
+    }
+    
+    std::vector<std::vector<uint64_t>> stored_columns(linkage.size());
+    for (size_t i = 0; i < linkage.size(); ++i) {
+        if (linkage[i].empty()) continue;
+        for (size_t j : linkage[i]) {
+            if (linkage[j].empty()) {
+                stored_columns[i].push_back(j);
+            } else {
+                for (size_t c : stored_columns[j]) {
+                    stored_columns[i].push_back(c);
+                }
+            }
+        }
+    }
+
+    // Capture the list of column files
+    std::vector<std::string> column_files;
     auto get_columns = [&](const BRWTBottomUpBuilder::CallColumn& call_column) {
         // Use load_columns_from_folder to process columns
         bool success = load_columns_from_folder_callback(
                 columns_folder_path, file_list,
                 [&](uint64_t j, const std::string& label,
                     std::unique_ptr<bit_vector>&& column) {
-                    // j: column index, label: column label, column: column data
+                    
+                    // Store path for streaming assembler
+                    {
+                        std::lock_guard<std::mutex> lock(mu);
+                        if (j >= column_files.size()) column_files.resize(j + 1);
+                        column_files[j] = columns_folder_path + "/" + label;
+                        column_names.emplace_back(j, label);
+                    }
+
                     // Pass the column to the BRWT builder
                     call_column(j, std::move(column));
-
-                    // Store column names (thread-safe)
-                    std::lock_guard<std::mutex> lock(mu);
-                    column_names.emplace_back(j, label);
                 },
                 num_threads, prefix);
 
@@ -616,23 +643,41 @@ void build_BRWT(const std::string columns_folder_path,
     auto t_start = std::chrono::high_resolution_clock::now();
 
     binary_matrix = std::make_unique<BRWT>(BRWTBottomUpBuilder::build(
-            get_columns, linkage, tmp_path, num_nodes_parallel, num_threads));
+            get_columns, linkage, tmp_path, column_files, num_nodes_parallel, num_threads));
 
     auto t_end = std::chrono::high_resolution_clock::now();
     double elapsed_sec = std::chrono::duration<double>(t_end - t_start).count();
     logger->info("BRWT build time: {:.2f} seconds.", elapsed_sec);
-    logger->info("BRWT stats: #rows = {}, #columns = {}, #relations = {}, avg_arity = {:.2f}, #nodes = {}, shrinking_rate = {:.2f}",
-                 binary_matrix->num_rows(), binary_matrix->num_columns(),
-                 binary_matrix->num_relations(), binary_matrix->avg_arity(),
-                 binary_matrix->num_nodes(), binary_matrix->shrinking_rate());
 
-    // Serialize the BRWT and measure time
+    // Assembly Phase
     auto t_ser_start = std::chrono::high_resolution_clock::now();
     std::ofstream out(output_path + ".brwt", std::ios::binary);
-    binary_matrix->serialize(out);
+    
+    if (!tmp_path.empty()) {
+        // Find the actual_tmp_dir by looking for "brwt" in tmp_path
+        std::filesystem::path tp(tmp_path);
+        std::filesystem::path brwt_nodes_dir;
+        for (const auto& entry : std::filesystem::directory_iterator(tp)) {
+            if (entry.is_directory() && entry.path().filename().string().find("brwt") != std::string::npos) {
+                brwt_nodes_dir = entry.path();
+                break;
+            }
+        }
+        
+        if (brwt_nodes_dir.empty()) {
+            logger->error("Could not find temporary nodes directory in {}", tmp_path);
+            exit(1);
+        }
+
+        BRWTBottomUpBuilder::assemble_streaming(out, linkage, stored_columns, brwt_nodes_dir, column_files);
+    } else {
+        // Fallback to standard serialization
+        binary_matrix->serialize(out);
+    }
+    
     auto t_ser_end = std::chrono::high_resolution_clock::now();
     double ser_elapsed_sec = std::chrono::duration<double>(t_ser_end - t_ser_start).count();
-    logger->info("BRWT serialization time: {:.2f} seconds.", ser_elapsed_sec);
+    logger->info("BRWT final assembly/serialization time: {:.2f} seconds.", ser_elapsed_sec);
 
     // Serialize the column names
     serialize_column_names(column_names, output_path + ".columns");

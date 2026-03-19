@@ -239,6 +239,8 @@ void compute_or(const std::vector<const bit_vector *> &columns,
                 assert(col_ptr);
                 assert(col_ptr->size() == size);
 
+                // GOAL 3: Use fast "scatter" for sparse vectors (Your idea!)
+                // is_sparser checks density. For sd_vector, threshold is 0.2
                 if (is_sparser(*col_ptr, 0, 0.2, 0.01, 0.01)) {
                     col_ptr->call_ones_in_range(begin, end,
                         [result](uint64_t k) { (*result)[k] = true; }
@@ -247,11 +249,23 @@ void compute_or(const std::vector<const bit_vector *> &columns,
                     assert((begin & 0x3F) == 0);
 
                     uint64_t *res_data = result->data();
-                    for (uint64_t i = begin; i + 64 <= end; i += 64) {
-                        res_data[i >> 6] |= col_ptr->get_int(i, 64);
+                    
+                    // GOAL 3: Use word-level OR for dense vectors
+                    // Optimization: If it's a standard uncompressed bit vector, 
+                    // we can access its data() directly to avoid virtual calls.
+                    if (const auto* stat_ptr = dynamic_cast<const bit_vector_stat*>(col_ptr)) {
+                        const uint64_t* col_data = stat_ptr->data().data();
+                        for (uint64_t j = (begin >> 6); j < (end >> 6); ++j) {
+                            res_data[j] |= col_data[j];
+                        }
+                    } else {
+                        // Fallback to safe get_int for other types (rrr, il, etc)
+                        for (uint64_t j = begin; j + 64 <= end; j += 64) {
+                            res_data[j >> 6] |= col_ptr->get_int(j, 64);
+                        }
+                        if (i < end)
+                            res_data[end >> 6] |= col_ptr->get_int(end & ~0x3Full, end & 0x3F);
                     }
-                    if (i < end)
-                        res_data[i >> 6] |= col_ptr->get_int(i, end - i);
                 }
             }
 

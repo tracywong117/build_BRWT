@@ -32,9 +32,11 @@ class BRWTBottomUpBuilder {
     using CallColumn
         = std::function<void(uint64_t, std::unique_ptr<bit_vector>&&)>;
 
+    // Case 2: Disk-assisted build
     static BRWT build(const std::function<void(const CallColumn &)> &get_columns,
                       const std::vector<std::vector<uint64_t>> &linkage,
                       const std::filesystem::path &tmp_dir,
+                      const std::vector<std::string> &column_files = {},
                       size_t num_nodes_parallel = 1,
                       size_t num_threads = 1);
 
@@ -44,7 +46,6 @@ class BRWTBottomUpBuilder {
                       size_t num_nodes_parallel = 1,
                       size_t num_threads = 1);
 
-  // private:
     // Concatenate multiple Multi-BRWT submatrices
     static BRWT concatenate(std::vector<BRWT>&& submatrices,
                             sdsl::bit_vector *buffer,
@@ -53,6 +54,16 @@ class BRWTBottomUpBuilder {
     static BRWT concatenate_sparse(std::vector<BRWT>&& submatrices,
                                    sdsl::bit_vector *buffer,
                                    ThreadPool &thread_pool);
+
+    // GOAL 1: Streaming assembly to avoid "RAM Wall"
+    static void assemble_streaming(std::ostream &out,
+                                   const std::vector<std::vector<uint64_t>> &linkage,
+                                   const std::vector<std::vector<uint64_t>> &stored_columns,
+                                   const std::filesystem::path &tmp_dir,
+                                   const std::vector<std::string> &column_files);
+
+  private:
+    static BRWT load_leaf_from_file(const std::string& path);
 };
 
 

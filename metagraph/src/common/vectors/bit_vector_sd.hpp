@@ -15,6 +15,7 @@ class bit_vector_sd : public bit_vector {
 
   public:
     inline explicit bit_vector_sd(uint64_t size = 0, bool value = false);
+    inline explicit bit_vector_sd(sdsl::sd_vector<>&& vector, bool inverted = false);
     inline explicit bit_vector_sd(const sdsl::bit_vector &vector);
     inline explicit bit_vector_sd(const sdsl::bit_vector &vector, uint64_t num_set_bits);
     inline explicit bit_vector_sd(const bit_vector_sd &other);
@@ -79,6 +80,13 @@ bit_vector_sd::bit_vector_sd(uint64_t size, bool value)
       : inverted_(value && size) {
     sdsl::sd_vector_builder builder(size, 0);
     vector_ = decltype(vector_)(builder);
+    rk1_ = decltype(rk1_)(&vector_);
+    slct1_ = decltype(slct1_)(&vector_);
+    slct0_ = decltype(slct0_)(&vector_);
+}
+
+bit_vector_sd::bit_vector_sd(sdsl::sd_vector<>&& vector, bool inverted)
+      : inverted_(inverted), vector_(std::move(vector)) {
     rk1_ = decltype(rk1_)(&vector_);
     slct1_ = decltype(slct1_)(&vector_);
     slct0_ = decltype(slct0_)(&vector_);
