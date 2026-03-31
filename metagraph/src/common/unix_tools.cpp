@@ -77,6 +77,12 @@ size_t get_peak_RSS() {
  * Returns the current resident set size (physical memory use) measured
  * in bytes, or zero if the value cannot be determined on this OS.
  */
+size_t get_total_RAM() {
+    long pages = sysconf(_SC_PHYS_PAGES);
+    long page_size = sysconf(_SC_PAGE_SIZE);
+    return (pages > 0 && page_size > 0) ? (size_t)pages * page_size : 0;
+}
+
 size_t get_curr_RSS()
 {
 #if defined(_WIN32)

@@ -252,23 +252,33 @@ bool BRWT::load(std::istream &in) {
         return false;
 
     try {
-        if (!assignments_.load(in))
+        if (!assignments_.load(in)) {
+            common::logger->error("BRWT::load: Failed to load assignments");
             return false;
+        }
 
-        if (!nonzero_rows_->load(in))
+        if (!nonzero_rows_->load(in)) {
+            common::logger->error("BRWT::load: Failed to load nonzero_rows");
             return false;
+        }
 
         size_t num_child_nodes = load_number(in);
         child_nodes_.clear();
         child_nodes_.reserve(num_child_nodes);
         for (size_t i = 0; i < num_child_nodes; ++i) {
             child_nodes_.emplace_back(new BRWT());
-            if (!child_nodes_.back()->load(in))
+            if (!child_nodes_.back()->load(in)) {
+                common::logger->error("BRWT::load: Failed to load child node {}", i);
                 return false;
+            }
         }
         return !child_nodes_.size()
                     || child_nodes_.size() == assignments_.num_groups();
+    } catch (const std::exception &e) {
+        common::logger->error("BRWT::load: Exception caught: {}", e.what());
+        return false;
     } catch (...) {
+        common::logger->error("BRWT::load: Unknown exception caught");
         return false;
     }
 }

@@ -16,6 +16,7 @@ bool stderr_to_terminal();
  * in bytes, or zero if the value cannot be determined on this OS.
  */
 size_t get_curr_RSS();
+size_t get_total_RAM();
 /**
  * Returns the peak (maximum so far) resident set size (physical
  * memory use) measured in bytes, or zero if the value cannot be
