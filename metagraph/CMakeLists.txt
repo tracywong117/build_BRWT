@@ -247,7 +247,8 @@ add_library(metagraph-cli STATIC ${metagraph_cli_files})
 add_dependencies(metagraph-core HTSLIB)
 
 add_executable(metagraph "${SRC_DIR}/main.cpp")
-set_target_properties(metagraph PROPERTIES OUTPUT_NAME "metagraph_${CMAKE_DBG_ALPHABET}")
+# To rename the binary, uncomment and edit the following line:
+# set_target_properties(metagraph PROPERTIES OUTPUT_NAME "your_name_here")
 
 if(BUILD_STATIC)
   set(JSONCPP_LIB jsoncpp_static)
@@ -310,14 +311,7 @@ target_link_libraries(metagraph-cli PUBLIC metagraph-core simple-web-server)
 
 target_link_libraries(metagraph metagraph-core metagraph-cli)
 
-# Symlink
-add_custom_target(link_target ALL
-  COMMAND ${CMAKE_COMMAND} -E
-  create_symlink
-    "metagraph_${CMAKE_DBG_ALPHABET}"
-    "metagraph"
-)
-add_dependencies(metagraph link_target)
+
 
 # Install
 file(GLOB_RECURSE header_files "${SRC_DIR}/*.hpp")

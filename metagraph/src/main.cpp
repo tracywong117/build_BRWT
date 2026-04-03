@@ -25,8 +25,7 @@
 #include "common/vectors/bit_vector_sd.hpp"
 #include "common/vectors/bit_vector_sdsl.hpp"
 #include "common/threads/threading.hpp"
-
-// Simple Web Server headers
+#include "cli/server_utils.hpp"
 #include <server_http.hpp>
 
 using namespace mtg;
@@ -239,7 +238,10 @@ void serialize_column_names(const std::vector<std::pair<uint64_t, std::string>>&
 
 std::vector<std::pair<uint64_t, std::string>> deserialize_column_names(const std::string& filename) {
     std::ifstream in(filename, std::ios::binary);
-    if (!in.is_open()) return {};
+    if (!in.is_open()) {
+        std::cerr << "Error: Failed to open columns file: " << filename << "\n";
+        return {};
+    }
     size_t size = 0;
     if (!in.read(reinterpret_cast<char*>(&size), sizeof(size))) return {};
     std::vector<std::pair<uint64_t, std::string>> names;
@@ -346,7 +348,15 @@ void handle_query(const std::string& ids_str, const std::string& brwt_f, const s
     while(std::getline(ss, segment, ',')) if (!segment.empty()) ids.push_back(std::stoull(segment));
     
     std::ifstream in(brwt_f, std::ios::binary);
-    BRWT brwt; brwt.load(in);
+    if (!in.is_open()) {
+        std::cerr << "Error: Failed to open BRWT file: " << brwt_f << "\n";
+        return;
+    }
+    BRWT brwt;
+    if (!brwt.load(in)) {
+        std::cerr << "Error: Failed to load BRWT from " << brwt_f << "\n";
+        return;
+    }
     auto results = brwt.get_rows(ids);
     auto names = deserialize_column_names(cols_f);
 
@@ -362,26 +372,228 @@ void handle_query(const std::string& ids_str, const std::string& brwt_f, const s
 
 } // namespace
 
+void print_general_usage(const char* progname) {
+    std::cerr << "Usage: " << progname << " <command> [options]\n"
+              << "\n"
+              << "Commands:\n"
+              << "  build   Build a BRWT index from annotation columns\n"
+              << "  query   Query rows from a BRWT index\n"
+              << "  stats   Print statistics of a BRWT index\n"
+              << "  server  Start an HTTP server to query the BRWT index\n"
+              << "\n"
+              << "Run '" << progname << " <command> --help' for more information on a command.\n";
+}
+
+void print_build_usage(const char* progname) {
+    std::cerr << "Usage: " << progname << " build <annotation_dir> <prefix> <output> [tmp_dir] [options]\n"
+              << "\n"
+              << "Build a BRWT index from sd_vector annotation columns.\n"
+              << "\n"
+              << "Positional arguments:\n"
+              << "  annotation_dir       Directory containing the sd_vector column files\n"
+              << "  prefix               Filename prefix to filter column files (e.g. \"col_\")\n"
+              << "  output               Output path prefix (produces <output>.brwt and <output>.columns)\n"
+              << "  tmp_dir              Optional temporary directory for streaming construction\n"
+              << "                       (must not start with '--'; omit for in-memory build)\n"
+              << "\n"
+              << "Options:\n"
+              << "  --threads N          Number of threads [default: hardware concurrency]\n"
+              << "  --list FILE          File listing column filenames (one per line), relative\n"
+              << "                       to annotation_dir. If omitted, all files matching the\n"
+              << "                       prefix in annotation_dir are used.\n"
+              << "  --full-nodes N       Number of full (uncompressed) internal nodes [default: 0]\n"
+              << "  --partial-nodes N    Number of partially compressed internal nodes [default: 0]\n"
+              << "  --linkage-k N        k parameter for greedy linkage clustering [default: 10]\n"
+              << "  --linkage-seed N     Random seed for linkage clustering [default: 42]\n"
+              << "  --linkage_trivial    Use trivial (sequential) linkage instead of greedy clustering\n"
+              << "  --resume             Resume a previously interrupted build\n"
+              << "\n"
+              << "Examples:\n"
+              << "  " << progname << " build ./columns col_ output_index\n"
+              << "  " << progname << " build ./columns col_ output_index /tmp/brwt --threads 16\n"
+              << "  " << progname << " build ./columns col_ output_index --list files.txt --linkage_trivial\n";
+}
+
+void print_query_usage(const char* progname) {
+    std::cerr << "Usage: " << progname << " query <brwt_file> <columns_file> <row_ids>\n"
+              << "\n"
+              << "Query rows from a BRWT index and print matching column names.\n"
+              << "\n"
+              << "Positional arguments:\n"
+              << "  brwt_file            Path to the .brwt index file\n"
+              << "  columns_file         Path to the .columns file (column name mapping)\n"
+              << "  row_ids              Comma-separated row IDs to query, optionally wrapped\n"
+              << "                       in braces, e.g. \"{0,1,2}\" or \"0,1,2\"\n"
+              << "\n"
+              << "Examples:\n"
+              << "  " << progname << " query output_index.brwt output_index.columns \"{0,1,42}\"\n"
+              << "  " << progname << " query output_index.brwt output_index.columns 0,1,42\n";
+}
+
+void print_stats_usage(const char* progname) {
+    std::cerr << "Usage: " << progname << " stats <brwt_file>\n"
+              << "\n"
+              << "Print statistics of a BRWT index.\n"
+              << "\n"
+              << "Positional arguments:\n"
+              << "  brwt_file            Path to the .brwt index file\n";
+}
+
+void print_server_usage(const char* progname) {
+    std::cerr << "Usage: " << progname << " server <brwt_file> <columns_file> [options]\n"
+              << "\n"
+              << "Start an HTTP server to query the BRWT index.\n"
+              << "\n"
+              << "Positional arguments:\n"
+              << "  brwt_file            Path to the .brwt index file\n"
+              << "  columns_file         Path to the .columns file (column name mapping)\n"
+              << "\n"
+              << "Options:\n"
+              << "  --port N             Port to listen on [default: 8080]\n";
+}
+
+void handle_stats(const std::string& brwt_f) {
+    std::ifstream in(brwt_f, std::ios::binary);
+    if (!in.is_open()) throw std::runtime_error("Failed to open " + brwt_f);
+    BRWT brwt; 
+    brwt.load(in);
+    
+    std::cout << "--- BRWT Statistics ---\n"
+              << "Number of rows:       " << brwt.num_rows() << "\n"
+              << "Number of columns:    " << brwt.num_columns() << "\n"
+              << "Number of set bits:   " << brwt.num_relations() << "\n"
+              << "Number of nodes:      " << brwt.num_nodes() << "\n"
+              << "Average arity:        " << brwt.avg_arity() << "\n"
+              << "Shrinking rate:       " << brwt.shrinking_rate() << "\n"
+              << "-----------------------\n";
+}
+
+void handle_server(const std::string& brwt_f, const std::string& cols_f, unsigned short port) {
+    logger->info("Loading BRWT index from {}...", brwt_f);
+    std::ifstream in(brwt_f, std::ios::binary);
+    if (!in.is_open()) throw std::runtime_error("Failed to open " + brwt_f);
+    BRWT brwt; 
+    brwt.load(in);
+    
+    logger->info("Loading column names from {}...", cols_f);
+    auto names = deserialize_column_names(cols_f);
+
+    mtg::cli::HttpServer server;
+    server.config.port = port;
+
+    server.resource["^/query$"]["POST"] = [&](std::shared_ptr<mtg::cli::HttpServer::Response> response, std::shared_ptr<mtg::cli::HttpServer::Request> request) {
+        mtg::cli::process_request(response, request, [&](const std::string& req_body) {
+            Json::Value req_json = mtg::cli::parse_json_string(req_body);
+            if (!req_json.isMember("row_ids") || !req_json["row_ids"].isArray()) {
+                throw std::runtime_error("Request must contain 'row_ids' array.");
+            }
+            
+            std::vector<uint64_t> ids;
+            for (const auto& id_val : req_json["row_ids"]) {
+                ids.push_back(id_val.asUInt64());
+            }
+            
+            auto results = brwt.get_rows(ids);
+            
+            Json::Value resp_json(Json::objectValue);
+            for (size_t i = 0; i < ids.size(); ++i) {
+                Json::Value row_res(Json::arrayValue);
+                for (auto bit : results[i]) {
+                    auto it = std::find_if(names.begin(), names.end(), [&](auto& p){ return p.first == bit; });
+                    if (it != names.end()) row_res.append(it->second);
+                }
+                resp_json[std::to_string(ids[i])] = row_res;
+            }
+            return Json::writeString(Json::StreamWriterBuilder(), resp_json);
+        });
+    };
+
+    logger->info("Starting server on port {}...", port);
+    server.start();
+}
+
 int main(int argc, char* argv[]) {
-    if (argc < 2) return 1;
+    if (argc < 2) {
+        print_general_usage(argv[0]);
+        return 1;
+    }
     std::string cmd = argv[1];
+
+    if (cmd == "--help" || cmd == "-h") {
+        print_general_usage(argv[0]);
+        return 0;
+    }
+
     try {
         if (cmd == "build") {
-            std::string dir = argv[2], pre = argv[3], out = argv[4], tmp = (argc > 5 && std::string(argv[5]).find("--") != 0) ? argv[5] : "";
+            if (argc < 5 || std::string(argv[2]) == "--help" || std::string(argv[2]) == "-h") {
+                print_build_usage(argv[0]);
+                return (argc >= 3 && (std::string(argv[2]) == "--help" || std::string(argv[2]) == "-h")) ? 0 : 1;
+            }
+            std::string dir = argv[2], pre = argv[3], out = argv[4];
+            std::string tmp = (argc > 5 && std::string(argv[5]).find("--") != 0) ? argv[5] : "";
+            std::string list_file;
             size_t threads = std::thread::hardware_concurrency();
             size_t full_nodes = 0, partial_nodes = 0;
+            size_t linkage_k = 0, linkage_seed = 42;
             bool trivial = false, resume = false;
-            for(int i=5; i<argc; ++i) {
-                if (std::string(argv[i]) == "--threads") threads = std::stoul(argv[++i]);
-                else if (std::string(argv[i]) == "--full-nodes") full_nodes = std::stoul(argv[++i]);
-                else if (std::string(argv[i]) == "--partial-nodes") partial_nodes = std::stoul(argv[++i]);
-                else if (std::string(argv[i]) == "--linkage_trivial") trivial = true;
-                else if (std::string(argv[i]) == "--resume") resume = true;
+            for (int i = 5; i < argc; ++i) {
+                std::string arg = argv[i];
+                if (arg == "--threads") threads = std::stoul(argv[++i]);
+                else if (arg == "--list") list_file = argv[++i];
+                else if (arg == "--full-nodes") full_nodes = std::stoul(argv[++i]);
+                else if (arg == "--partial-nodes") partial_nodes = std::stoul(argv[++i]);
+                else if (arg == "--linkage-k") linkage_k = std::stoul(argv[++i]);
+                else if (arg == "--linkage-seed") linkage_seed = std::stoul(argv[++i]);
+                else if (arg == "--linkage_trivial") trivial = true;
+                else if (arg == "--resume") resume = true;
+                else if (arg == "--help" || arg == "-h") { print_build_usage(argv[0]); return 0; }
+                else if (arg.substr(0, 2) == "--") {
+                    std::cerr << "Unknown option: " << arg << "\n\n";
+                    print_build_usage(argv[0]);
+                    return 1;
+                }
             }
-            handle_build(dir, pre, out, tmp, "", threads, full_nodes, partial_nodes, 0, 42, trivial, resume);
+            handle_build(dir, pre, out, tmp, list_file, threads, full_nodes, partial_nodes, linkage_k, linkage_seed, trivial, resume);
         } else if (cmd == "query") {
+            if (argc < 5 || std::string(argv[2]) == "--help" || std::string(argv[2]) == "-h") {
+                print_query_usage(argv[0]);
+                return (argc >= 3 && (std::string(argv[2]) == "--help" || std::string(argv[2]) == "-h")) ? 0 : 1;
+            }
             handle_query(argv[4], argv[2], argv[3]);
+        } else if (cmd == "stats") {
+            if (argc < 3 || std::string(argv[2]) == "--help" || std::string(argv[2]) == "-h") {
+                print_stats_usage(argv[0]);
+                return (argc >= 3 && (std::string(argv[2]) == "--help" || std::string(argv[2]) == "-h")) ? 0 : 1;
+            }
+            handle_stats(argv[2]);
+        } else if (cmd == "server") {
+            if (argc < 4 || std::string(argv[2]) == "--help" || std::string(argv[2]) == "-h") {
+                print_server_usage(argv[0]);
+                return (argc >= 3 && (std::string(argv[2]) == "--help" || std::string(argv[2]) == "-h")) ? 0 : 1;
+            }
+            std::string brwt_f = argv[2];
+            std::string cols_f = argv[3];
+            unsigned short port = 8080;
+            for (int i = 4; i < argc; ++i) {
+                std::string arg = argv[i];
+                if (arg == "--port" && i + 1 < argc) port = std::stoul(argv[++i]);
+                else if (arg == "--help" || arg == "-h") { print_server_usage(argv[0]); return 0; }
+                else {
+                    std::cerr << "Unknown option: " << arg << "\n\n";
+                    print_server_usage(argv[0]);
+                    return 1;
+                }
+            }
+            handle_server(brwt_f, cols_f, port);
+        } else {
+            std::cerr << "Unknown command: " << cmd << "\n\n";
+            print_general_usage(argv[0]);
+            return 1;
         }
-    } catch (const std::exception& e) { std::cerr << e.what() << "\n"; return 1; }
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << "\n";
+        return 1;
+    }
     return 0;
 }

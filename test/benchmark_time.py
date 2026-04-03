@@ -6,8 +6,8 @@ import shutil
 import random
 
 # Configuration
-METAGRAPH_BIN = "../build/metagraph_DNA"
-# METAGRAPH_BIN = "../build_original_optimized/metagraph_DNA"
+METAGRAPH_BIN = "../build/metagraph"
+# METAGRAPH_BIN = "../build_original_optimized/metagraph"
 GEN_VECTORS_BIN = "./gen_sdsl_vectors"
 TMP_DIR = "/media/data/tracy/build_BRWT/test/tmp"
 DATA_DIR = "benchmark_data"
@@ -33,59 +33,141 @@ def setup():
         subprocess.check_call("bash compile_test.sh", shell=True)
 
 def verify_correctness():
-    truth_file = os.path.join(DATA_DIR, f"_col_truth.txt")
+    truth_file = os.path.join(DATA_DIR, "_col_truth.txt")
     if not os.path.exists(truth_file):
         print("Truth file not found, skipping verification.")
         return
 
-    print("\n--- Verifying Correctness ---")
-    
-    # Load sample truth data (first 5 distinct rows found)
-    truth_sample = {} # row_id -> set of column names
+    print("\n--- Verifying Correctness (comprehensive) ---")
+
+    # Phase 1: Build a complete truth index from the truth file.
+    # truth_index: row_id -> set of column filenames
+    print("  Loading truth file (this may take a moment)...")
+    truth_index = {}   # row_id -> set(col_name.sd, ...)
+    all_row_ids = set()
+    load_start = time.time()
     with open(truth_file, 'r') as f:
         for line in f:
-            parts = line.strip().split()
+            parts = line.split()
             if len(parts) != 2:
                 continue
-            row_id_str, col_name = parts
-            row_id = int(row_id_str)
-            if row_id not in truth_sample:
-                if len(truth_sample) >= 5:
-                    continue
-                truth_sample[row_id] = set()
-            truth_sample[row_id].add(col_name + ".sd")
-            if len(truth_sample) >= 5 and row_id not in truth_sample:
+            row_id = int(parts[0])
+            col_name = parts[1] + ".sd"
+            all_row_ids.add(row_id)
+            if row_id not in truth_index:
+                truth_index[row_id] = set()
+            truth_index[row_id].add(col_name)
+    load_elapsed = time.time() - load_start
+    print(f"  Loaded {len(truth_index):,} rows with set bits from truth file in {load_elapsed:.1f}s")
+
+    # Phase 2: Select a diverse set of rows to verify.
+    NUM_VERIFY = 100
+    sorted_row_ids = sorted(truth_index.keys())
+
+    selected_rows = set()
+
+    # (a) Boundary rows: first and last rows that have any bits set
+    selected_rows.add(sorted_row_ids[0])
+    selected_rows.add(sorted_row_ids[-1])
+
+    # (b) Rows with the most columns set (stress-test dense rows)
+    by_count = sorted(truth_index.items(), key=lambda x: len(x[1]), reverse=True)
+    for row_id, _ in by_count[:5]:
+        selected_rows.add(row_id)
+
+    # (c) Rows with the fewest columns set (sparse rows, often just 1 column)
+    by_count_asc = sorted(truth_index.items(), key=lambda x: len(x[1]))
+    for row_id, _ in by_count_asc[:5]:
+        selected_rows.add(row_id)
+
+    # (d) Rows with zero columns set (should return empty)
+    #     Pick some row IDs that do NOT appear in the truth file
+    zero_rows_added = 0
+    for candidate in range(NUM_ROWS):
+        if candidate not in all_row_ids:
+            selected_rows.add(candidate)
+            zero_rows_added += 1
+            if zero_rows_added >= 5:
                 break
 
-    for row_id, expected_cols in truth_sample.items():
-        # Query format: metagraph query <brwtFile> <columnsFile> <rowIds>
-        # Note: we wrap row_id in {} as expected by the query handler
-        query_cmd = f"{METAGRAPH_BIN} query {DATA_DIR}/{OUTPUT_FILE}.brwt {DATA_DIR}/{OUTPUT_FILE}.columns '{{{row_id}}}'"
-        print(f"  Checking Row {row_id}...")
+    # (e) Uniformly spaced rows across the entire range
+    step = max(1, len(sorted_row_ids) // 20)
+    for i in range(0, len(sorted_row_ids), step):
+        selected_rows.add(sorted_row_ids[i])
+
+    # (f) Random sample to fill up to NUM_VERIFY
+    remaining = NUM_VERIFY - len(selected_rows)
+    if remaining > 0:
+        pool = [r for r in sorted_row_ids if r not in selected_rows]
+        if len(pool) > remaining:
+            selected_rows.update(random.sample(pool, remaining))
+        else:
+            selected_rows.update(pool)
+
+    selected_rows = sorted(selected_rows)
+    print(f"  Verifying {len(selected_rows)} rows "
+          f"(boundary, densest, sparsest, zero-column, evenly-spaced, random)...")
+
+    # Phase 3: Query in batches and compare.
+    BATCH_SIZE = 50  # rows per query invocation
+    passed = 0
+    failed = 0
+    errors = []
+
+    for batch_start in range(0, len(selected_rows), BATCH_SIZE):
+        batch = selected_rows[batch_start:batch_start + BATCH_SIZE]
+        ids_str = ",".join(str(r) for r in batch)
+        query_cmd = (
+            f"{METAGRAPH_BIN} query "
+            f"{DATA_DIR}/{OUTPUT_FILE}.brwt "
+            f"{DATA_DIR}/{OUTPUT_FILE}.columns "
+            f"'{{{ids_str}}}'"
+        )
         try:
             output = subprocess.check_output(query_cmd, shell=True).decode()
-            print(f"    Query Output: {output.strip()}")
-            
-            # Parse output: "Row {id}: col1.sd col2.sd ..."
-            actual_cols = set()
-            for line in output.splitlines():
-                if line.startswith(f"Row {row_id}:"):
-                    actual_part = line.split(":", 1)[1].strip()
-                    actual_cols = set(actual_part.split())
-                    break
-            
-            if actual_cols == expected_cols:
-                print(f"    [PASS] Found {len(actual_cols)} matching columns.")
-            else:
-                print(f"    [FAIL] Row {row_id} mismatch!")
-                print(f"      Expected ({len(expected_cols)}): {sorted(list(expected_cols))[:10]}...")
-                print(f"      Actual   ({len(actual_cols)}): {sorted(list(actual_cols))[:10]}...")
-                sys.exit(1)
         except subprocess.CalledProcessError as e:
-            print(f"    [ERROR] Query failed: {e}")
+            print(f"  [ERROR] Query command failed: {e}")
             sys.exit(1)
-    
-    print("Correctness verification passed successfully.")
+
+        # Parse all "Row <id>: col1 col2 ..." lines from output
+        actual_map = {}
+        for line in output.splitlines():
+            if not line.startswith("Row "):
+                continue
+            colon_idx = line.index(":")
+            rid = int(line[4:colon_idx])
+            cols_part = line[colon_idx + 1:].strip()
+            actual_map[rid] = set(cols_part.split()) if cols_part else set()
+
+        # Compare each row in this batch
+        for row_id in batch:
+            expected = truth_index.get(row_id, set())
+            actual = actual_map.get(row_id, set())
+
+            if actual == expected:
+                passed += 1
+            else:
+                failed += 1
+                missing = expected - actual
+                extra = actual - expected
+                detail = f"Row {row_id}: expected {len(expected)} cols, got {len(actual)} cols"
+                if missing:
+                    detail += f"; missing {len(missing)}: {sorted(missing)[:5]}"
+                if extra:
+                    detail += f"; extra {len(extra)}: {sorted(extra)[:5]}"
+                errors.append(detail)
+                if len(errors) <= 10:
+                    print(f"    [FAIL] {detail}")
+
+    # Phase 4: Summary
+    print(f"\n  Verification Summary: {passed}/{passed + failed} rows passed")
+    if failed:
+        if len(errors) > 10:
+            print(f"  (showing first 10 of {len(errors)} failures)")
+        print("  CORRECTNESS CHECK FAILED!")
+        sys.exit(1)
+    else:
+        print("  All rows verified successfully. ✓")
 
 def main():
     if not os.path.exists(METAGRAPH_BIN):

@@ -48,3 +48,4 @@ benchmark_data*/
 build_*/
 original_src*/
 test/tmp/
+*.bak.py
