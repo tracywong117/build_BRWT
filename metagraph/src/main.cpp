@@ -486,22 +486,46 @@ void handle_query_nodes(const std::string& linkage_file, const std::string& node
 // ───────────────────────────────────────────────────────────────────────────────
 
 void handle_query(const std::string& ids_str, const std::string& brwt_f, const std::string& cols_f) {
-    std::vector<uint64_t> ids; std::string cleaned = ids_str;
+    std::vector<uint64_t> ids;
+    std::string cleaned = ids_str;
     cleaned.erase(std::remove(cleaned.begin(), cleaned.end(), '{'), cleaned.end());
     cleaned.erase(std::remove(cleaned.begin(), cleaned.end(), '}'), cleaned.end());
     std::stringstream ss(cleaned); std::string segment;
-    while(std::getline(ss, segment, ',')) if (!segment.empty()) ids.push_back(std::stoull(segment));
-    std::ifstream in(brwt_f, std::ios::binary); BRWT brwt; brwt.load(in);
-    auto results = brwt.get_rows(ids); auto names = deserialize_column_names(cols_f);
+    while (std::getline(ss, segment, ',')) if (!segment.empty()) ids.push_back(std::stoull(segment));
+
+    std::ifstream in(brwt_f, std::ios::binary);
+    if (!in.is_open())
+        throw std::runtime_error("query: cannot open BRWT file: " + brwt_f);
+
+    BRWT brwt;
+    if (!brwt.load(in))
+        throw std::runtime_error("query: failed to load BRWT from: " + brwt_f
+            + " (file may be corrupt or wrong format)");
+
+    logger->info("[query] Loaded {} columns, {} rows from {}",
+                 brwt.num_columns(), brwt.num_rows(), brwt_f);
+
+    // Validate row IDs before querying to avoid assert/segfault inside slice_rows
+    for (uint64_t id : ids) {
+        if (id >= brwt.num_rows())
+            throw std::runtime_error("query: row id " + std::to_string(id)
+                + " out of range (index has " + std::to_string(brwt.num_rows()) + " rows)");
+    }
+
+    auto results = brwt.get_rows(ids);
+    auto names   = deserialize_column_names(cols_f);
+
     for (size_t i = 0; i < ids.size(); ++i) {
         std::cout << "Row " << ids[i] << ": ";
         for (auto bit : results[i]) {
             auto it = std::find_if(names.begin(), names.end(), [&](auto& p){ return p.first == bit; });
             if (it != names.end()) std::cout << it->second << " ";
+            else                   std::cout << "col_" << bit << " ";
         }
         std::cout << "\n";
     }
 }
+
 
 void show_usage(const std::string& program_name) {
     std::cerr << "Multi-BRWT Optimized Build Tool (Adaptive Strategy Engine)\n"

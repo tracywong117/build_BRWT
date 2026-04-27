@@ -1060,27 +1060,77 @@ void BRWTBottomUpBuilder::merge_nodes(const std::filesystem::path &linkage_a_pat
 
 void BRWTOptimizer::relax(BRWT *brwt_matrix, uint64_t max_arity, size_t num_threads) {
     assert(brwt_matrix);
+
+    // BFT collects internal nodes in BFS order; push_front gives bottom-up (deepest first).
     std::deque<BRWT*> parents;
     brwt_matrix->BFT([&](const BRWT &node) {
         if (node.child_nodes_.size())
             parents.push_front(const_cast<BRWT*>(&node));
     });
 
-    ProgressBar progress_bar(parents.size(), "Relax Multi-BRWT",
+    size_t total_internal = parents.size();
+    logger->info("[relax] Tree loaded: {} columns, {} rows, {} internal nodes, "
+                 "max_arity limit {}",
+                 brwt_matrix->num_columns(), brwt_matrix->num_rows(),
+                 total_internal, max_arity);
+
+    ProgressBar progress_bar(total_internal, "Relax Multi-BRWT",
                              std::cerr, !common::get_verbose());
 
+    size_t nodes_processed = 0;
+    size_t nodes_pruned    = 0;
+    int    last_pct        = 0;
+    auto   t_start         = std::chrono::high_resolution_clock::now();
+
     for (BRWT *parent : parents) {
-        for (int g = parent->child_nodes_.size() - 1; g >= 0; --g) {
+        size_t arity_before = parent->child_nodes_.size();
+
+        for (int g = (int)parent->child_nodes_.size() - 1; g >= 0; --g) {
             const auto *node = dynamic_cast<const BRWT*>(parent->child_nodes_[g].get());
             if (node && should_prune(*node)
                      && parent->child_nodes_.size() - 1
                             + node->child_nodes_.size() <= max_arity) {
+                size_t child_arity = node->child_nodes_.size();
                 reassign(g, parent, num_threads);
+                // logger->info("[relax] Pruned child (slot {}) under parent "
+                //              "| parent arity {} → {} (child had {} children)",
+                //              g, arity_before,
+                //              parent->child_nodes_.size(), child_arity);
+                ++nodes_pruned;
+                // arity_before tracks the initial arity for logging consecutive prunes
+                arity_before = parent->child_nodes_.size();
             }
         }
+
         ++progress_bar;
+        ++nodes_processed;
+
+        // Progress milestone every 5% (only when ≥ 20 internal nodes)
+        if (total_internal >= 20) {
+            int pct       = (int)((nodes_processed * 100) / total_internal);
+            int milestone = (pct / 5) * 5;
+            if (milestone > last_pct && milestone < 100) {
+                last_pct = milestone;
+                auto now     = std::chrono::high_resolution_clock::now();
+                double elapsed = std::chrono::duration<double>(now - t_start).count();
+                double frac    = (double)nodes_processed / total_internal;
+                double eta     = elapsed / frac * (1.0 - frac);
+                logger->info("[relax] {}% ({}/{} nodes) | pruned so far: {} | "
+                             "elapsed: {:.1f}s | ETA: {:.1f}s",
+                             milestone, nodes_processed, total_internal,
+                             nodes_pruned, elapsed, eta);
+            }
+        }
     }
+
+    auto t_end = std::chrono::high_resolution_clock::now();
+    double total_sec = std::chrono::duration<double>(t_end - t_start).count();
+    logger->info("[relax] Done. Processed {} internal nodes, pruned {} nodes "
+                 "in {:.1f}s. Final columns: {}, rows: {}.",
+                 total_internal, nodes_pruned, total_sec,
+                 brwt_matrix->num_columns(), brwt_matrix->num_rows());
 }
+
 
 void BRWTOptimizer::relax_nodes(std::vector<std::vector<uint64_t>> &linkage,
                                 const std::filesystem::path &node_dir,
@@ -1089,35 +1139,47 @@ void BRWTOptimizer::relax_nodes(std::vector<std::vector<uint64_t>> &linkage,
     size_t num_nodes = linkage.size();
     if (!num_nodes) return;
 
-    // 1. Identify internal nodes and build BFS order
+    // ── 1. BFS to collect internal nodes and compute depth levels ─────────────
     std::deque<uint64_t> queue;
     std::vector<uint64_t> bfs_order;
-    queue.push_back(num_nodes - 1); // Start from Root
+    std::vector<size_t> depth(num_nodes, 0); // depth from root (root = 0)
+    queue.push_back(num_nodes - 1);          // root
 
     std::vector<bool> visited(num_nodes, false);
+    size_t max_depth = 0;
     while (!queue.empty()) {
         uint64_t curr = queue.front();
         queue.pop_front();
         if (curr < num_nodes && !linkage[curr].empty() && !visited[curr]) {
             visited[curr] = true;
             bfs_order.push_back(curr);
-            for (uint64_t child : linkage[curr]) queue.push_back(child);
+            for (uint64_t child : linkage[curr]) {
+                if (child < num_nodes) {
+                    depth[child] = depth[curr] + 1;
+                    max_depth = std::max(max_depth, depth[child]);
+                }
+                queue.push_back(child);
+            }
         }
     }
-    // Reverse to process bottom-up
+    // Reverse to process bottom-up (leaves-first order)
     std::reverse(bfs_order.begin(), bfs_order.end());
 
+    size_t total_internal = bfs_order.size();
+    size_t total_leaves   = num_nodes - total_internal;
+    logger->info("[relax-nodes] Tree summary: {} total nodes ({} internal, {} leaves), "
+                 "max depth {}, max_arity limit {}",
+                 num_nodes, total_internal, total_leaves, max_depth, max_arity);
+
+    // ── 2. load_node / save_node (support both bare <id> and node_<id>) ───────
     auto load_node = [&](uint64_t id) {
         BRWT node;
-        // After a completed build the root is stored as `<id>` (union bv) and
-        // every other node is stored as `node_<id>` (sub-index).  Try both so
-        // relax-nodes works whether the folder is mid-build or fully assembled.
-        auto path_bare  = node_dir / std::to_string(id);
+        auto path_bare     = node_dir / std::to_string(id);
         auto path_prefixed = node_dir / ("node_" + std::to_string(id));
 
         std::filesystem::path chosen;
-        if (std::filesystem::exists(path_bare))           chosen = path_bare;
-        else if (std::filesystem::exists(path_prefixed))  chosen = path_prefixed;
+        if (std::filesystem::exists(path_bare))          chosen = path_bare;
+        else if (std::filesystem::exists(path_prefixed)) chosen = path_prefixed;
         else {
             logger->error("Relax: Cannot find node {} — tried:\n  {}\n  {}",
                           id, path_bare.string(), path_prefixed.string());
@@ -1129,11 +1191,14 @@ void BRWTOptimizer::relax_nodes(std::vector<std::vector<uint64_t>> &linkage,
             logger->error("Relax: Failed to load node {} from {}", id, chosen.string());
             exit(1);
         }
+        logger->debug("[relax-nodes] Loaded node {} from {} ({} rows, {} set bits)",
+                      id, chosen.filename().string(),
+                      node.num_rows(),
+                      node.nonzero_rows_ ? node.nonzero_rows_->num_set_bits() : 0);
         return node;
     };
 
     auto save_node = [&](BRWT& node, uint64_t id) {
-        // Mirror load_node: write back to whichever file already exists.
         auto path_bare     = node_dir / std::to_string(id);
         auto path_prefixed = node_dir / ("node_" + std::to_string(id));
         std::filesystem::path target = std::filesystem::exists(path_bare)
@@ -1146,53 +1211,108 @@ void BRWTOptimizer::relax_nodes(std::vector<std::vector<uint64_t>> &linkage,
         std::filesystem::rename(partial_name, target);
     };
 
-    ProgressBar progress_bar(bfs_order.size(), "Relaxing Nodes", std::cerr, !common::get_verbose());
+    // ── 3. Main bottom-up relaxation loop ─────────────────────────────────────
+    ProgressBar progress_bar(total_internal, "Relaxing Nodes", std::cerr, !common::get_verbose());
+
+    size_t nodes_processed = 0;
+    size_t nodes_pruned    = 0;   // internal nodes eliminated
+    int    last_pct        = 0;
+    auto   t_start         = std::chrono::high_resolution_clock::now();
 
     for (uint64_t p_id : bfs_order) {
         BRWT parent = load_node(p_id);
         bool changed = false;
 
-        // Populate parent with actual child objects for the optimizer logic
+        size_t arity_before = linkage[p_id].size();
+
+        // Populate parent with child objects.
+        // IMPORTANT: each child also needs its own children (grandchildren of parent)
+        // populated so that should_prune() — which checks child.child_nodes_.size() > 0
+        // and calls pruning_delta() on child's children — can evaluate correctly.
+        // This matches what relax() sees naturally in the fully in-memory tree.
         parent.child_nodes_.resize(linkage[p_id].size());
         for (size_t g = 0; g < linkage[p_id].size(); ++g) {
-            parent.child_nodes_[g].reset(new BRWT(load_node(linkage[p_id][g])));
+            uint64_t c_id = linkage[p_id][g];
+            auto child_brwt = std::make_unique<BRWT>(load_node(c_id));
+            // Populate grandchildren so should_prune / pruning_delta work
+            if (!linkage[c_id].empty()) {
+                child_brwt->child_nodes_.resize(linkage[c_id].size());
+                for (size_t h = 0; h < linkage[c_id].size(); ++h)
+                    child_brwt->child_nodes_[h].reset(new BRWT(load_node(linkage[c_id][h])));
+            }
+            parent.child_nodes_[g] = std::move(child_brwt);
         }
 
-        // Try to prune each child
-        for (int g = parent.child_nodes_.size() - 1; g >= 0; --g) {
-            BRWT* child = dynamic_cast<BRWT*>(parent.child_nodes_[g].get());
+        // Try to prune each child (iterate backwards so erases don't shift indices)
+        for (int g = (int)parent.child_nodes_.size() - 1; g >= 0; --g) {
+            BRWT* child   = dynamic_cast<BRWT*>(parent.child_nodes_[g].get());
             uint64_t c_id = linkage[p_id][g];
 
             if (child && !linkage[c_id].empty() && should_prune(*child)
                 && parent.child_nodes_.size() - 1 + linkage[c_id].size() <= max_arity) {
-                
-                // Get the grandchild IDs before they are merged
+
+                size_t old_arity      = linkage[p_id].size();
+                size_t child_arity    = linkage[c_id].size();
                 std::vector<uint64_t> grandchildren_ids = linkage[c_id];
-                
+
                 reassign(g, &parent, num_threads);
-                
-                // Update Global Linkage: remove child, insert grandchildren
+
                 linkage[p_id].erase(linkage[p_id].begin() + g);
-                linkage[p_id].insert(linkage[p_id].begin() + g, grandchildren_ids.begin(), grandchildren_ids.end());
-                
-                // Delete the pruned node from disk (try both naming conventions)
+                linkage[p_id].insert(linkage[p_id].begin() + g,
+                                     grandchildren_ids.begin(), grandchildren_ids.end());
+
+                // Delete the pruned intermediate node from disk (try both names)
                 std::error_code ec;
                 if (!std::filesystem::remove(node_dir / std::to_string(c_id), ec))
                     std::filesystem::remove(node_dir / ("node_" + std::to_string(c_id)), ec);
+
+                // logger->info("[relax-nodes] Pruned node {} (depth {}) under parent {} | "
+                //              "parent arity {} → {} (child had {} children)",
+                //              c_id, depth[c_id], p_id,
+                //              old_arity, linkage[p_id].size(), child_arity);
+                ++nodes_pruned;
                 changed = true;
             }
         }
 
         if (changed) {
-            // Save updated grandchildren (they now have new sub-indices against the grandparent)
-            for (size_t g = 0; g < linkage[p_id].size(); ++g) {
+            for (size_t g = 0; g < linkage[p_id].size(); ++g)
                 save_node(*parent.child_nodes_[g], linkage[p_id][g]);
-            }
             save_node(parent, p_id);
+
+            // size_t arity_after = linkage[p_id].size();
+            // if (arity_after != arity_before)
+            //     logger->info("[relax-nodes]   → node {} arity: {} → {}",
+            //                  p_id, arity_before, arity_after);
         }
+
         ++progress_bar;
+        ++nodes_processed;
+
+        // Progress milestone every 5% (only when ≥ 20 internal nodes)
+        if (total_internal >= 20) {
+            int pct = (int)((nodes_processed * 100) / total_internal);
+            int milestone = (pct / 5) * 5;
+            if (milestone > last_pct && milestone < 100) {
+                last_pct = milestone;
+                auto now     = std::chrono::high_resolution_clock::now();
+                double elapsed = std::chrono::duration<double>(now - t_start).count();
+                double frac    = (double)nodes_processed / total_internal;
+                double eta     = elapsed / frac * (1.0 - frac);
+                logger->info("[relax-nodes] {}% ({}/{} nodes) | pruned so far: {} | "
+                             "elapsed: {:.1f}s | ETA: {:.1f}s",
+                             milestone, nodes_processed, total_internal,
+                             nodes_pruned, elapsed, eta);
+            }
+        }
     }
+
+    auto t_end = std::chrono::high_resolution_clock::now();
+    double total_sec = std::chrono::duration<double>(t_end - t_start).count();
+    logger->info("[relax-nodes] Done. Processed {} internal nodes, pruned {} nodes "
+                 "in {:.1f}s.", total_internal, nodes_pruned, total_sec);
 }
+
 
 bool BRWTOptimizer::should_prune(const BRWT &node) {
     if (!node.child_nodes_.size()) return false;
