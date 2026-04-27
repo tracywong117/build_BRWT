@@ -32,11 +32,11 @@ class BRWTBottomUpBuilder {
     using CallColumn
         = std::function<void(uint64_t, std::unique_ptr<bit_vector>&&)>;
 
-    // Case 2: Disk-assisted build
+    // Disk-assisted build
     static BRWT build(const std::function<void(const CallColumn &)> &get_columns,
                       const std::vector<std::vector<uint64_t>> &linkage,
                       const std::filesystem::path &tmp_dir,
-                      const std::vector<std::vector<uint64_t>> &stored_columns = {},
+                      const std::vector<std::vector<uint64_t>> &stored_columns,
                       const std::vector<std::string> &column_files = {},
                       size_t num_full_nodes = 0,
                       size_t num_partial_nodes = 0,
@@ -44,11 +44,23 @@ class BRWTBottomUpBuilder {
                       std::string *actual_tmp_dir_out = nullptr,
                       bool resume = true);
 
-    // Merge multiple binary matrices compressed with Multi-BRWT
-    static BRWT merge(std::vector<BRWT>&& matrices,
-                      Partitioner partitioner = get_basic_partitioner(),
-                      size_t num_nodes_parallel = 1,
+    // Merge two monolithic .brwt files (same row length) into one output .brwt.
+    // Column names are NOT handled here; see handle_merge() in main.cpp.
+    static void merge(const std::filesystem::path &brwt_a,
+                      const std::filesystem::path &brwt_b,
+                      const std::filesystem::path &output_prefix,
                       size_t num_threads = 1);
+
+    // Merge two node-folder BRWT representations (same row length).
+    // Both formats: linkage file + directory of node_<id> files + one <root_id> file.
+    // Output: new node folder + merged linkage file.
+    static void merge_nodes(const std::filesystem::path &linkage_a,
+                            const std::filesystem::path &node_dir_a,
+                            const std::filesystem::path &linkage_b,
+                            const std::filesystem::path &node_dir_b,
+                            const std::filesystem::path &output_node_dir,
+                            const std::filesystem::path &output_linkage,
+                            size_t num_threads = 1);
 
     // Concatenate multiple Multi-BRWT submatrices
     static BRWT concatenate(std::vector<BRWT>&& submatrices,
@@ -56,7 +68,7 @@ class BRWTBottomUpBuilder {
                             ThreadPool &thread_pool,
                             const std::filesystem::path &node_tmp_path = "");
 
-    // GOAL 1: Streaming assembly to avoid "RAM Wall"
+    // Streaming assembly to avoid "RAM Wall"
     static void assemble_streaming(std::ostream &out,
                                    const std::vector<std::vector<uint64_t>> &linkage,
                                    const std::vector<std::vector<uint64_t>> &stored_columns,
@@ -65,6 +77,18 @@ class BRWTBottomUpBuilder {
                                    bool cleanup_tmp = false);
 
     static BRWT load_leaf_from_file(const std::string& path);
+
+    // Query rows from a BRWT stored as a nodes folder (disk-based format).
+    // Returns one vector of set column IDs per query row (same order as `row_ids`).
+    // `linkage`   : linkage matrix as produced by parse_linkage_matrix().
+    // `node_dir`  : folder containing node_<id> files for all non-root nodes
+    //               and a single <root_id> file for the root (union bit-vector).
+    // `log_stats` : when true, logs a summary (nodes loaded, hits, etc.) at the end.
+    static std::vector<std::vector<uint64_t>>
+    query_nodes(const std::vector<uint64_t>& row_ids,
+                const std::vector<std::vector<uint64_t>>& linkage,
+                const std::filesystem::path& node_dir,
+                bool log_stats = false);
 };
 
 
@@ -77,11 +101,17 @@ class BRWTOptimizer {
     static void relax(BRWT *brwt_matrix,
                       uint64_t max_arity = -1,
                       size_t num_threads = 1);
+
+    // GOAL: High-scale Node Folder Relaxation
+    static void relax_nodes(std::vector<std::vector<uint64_t>> &linkage,
+                            const std::filesystem::path &node_dir,
+                            uint64_t max_arity,
+                            size_t num_threads);
+
   private:
     // check if removing this node is going to reduce the size
     static bool should_prune(const BRWT &node);
     // remove the node and reassign all its children to its parent
-    // estimate delta between the transformed tree and the current one
     static void reassign(size_t node_rank, BRWT *parent, size_t num_threads);
     static double pruning_delta(const BRWT &node);
 };

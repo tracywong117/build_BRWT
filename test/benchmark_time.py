@@ -6,12 +6,15 @@ import shutil
 import random
 
 # Configuration
-METAGRAPH_BIN = "../build/metagraph"
+METAGRAPH_BIN = "../build_static/metagraph"
 # METAGRAPH_BIN = "../build_original_optimized/metagraph"
 GEN_VECTORS_BIN = "./gen_sdsl_vectors"
 TMP_DIR = "/media/data/tracy/build_BRWT/test/tmp"
 DATA_DIR = "benchmark_data"
 OUTPUT_FILE = "bench_new.brwt"
+
+# Optional cross-check: verify `query-nodes` returns the same rows as `query`.
+VERIFY_QUERY_NODES = True
 
 # Benchmark Parameters
 # Increased size to make I/O and bitwise math optimizations visible.
@@ -19,6 +22,19 @@ NUM_ROWS = 10_000_000  # 10M rows
 NUM_COLS = 1000        # 1000 columns
 SPARSITY = 0.01        # 1% density
 THREADS = os.cpu_count() or 1
+
+
+def parse_query_output(output):
+    """Parse all `Row <id>: col1 col2 ...` lines into {row_id: set(columns)}."""
+    result = {}
+    for line in output.splitlines():
+        if not line.startswith("Row "):
+            continue
+        colon_idx = line.index(":")
+        rid = int(line[4:colon_idx])
+        cols_part = line[colon_idx + 1:].strip()
+        result[rid] = set(cols_part.split()) if cols_part else set()
+    return result
 
 def run_command(cmd):
     print(f"Executing: {cmd}")
@@ -39,6 +55,19 @@ def verify_correctness():
         return
 
     print("\n--- Verifying Correctness (comprehensive) ---")
+
+    linkage_file = os.path.join(DATA_DIR, f"{OUTPUT_FILE}.linkage")
+    columns_file = os.path.join(DATA_DIR, f"{OUTPUT_FILE}.columns")
+    brwt_file = os.path.join(DATA_DIR, f"{OUTPUT_FILE}.brwt")
+
+    do_query_nodes_check = (
+        VERIFY_QUERY_NODES
+        and os.path.exists(linkage_file)
+        and os.path.exists(columns_file)
+        and os.path.isdir(TMP_DIR)
+    )
+    if VERIFY_QUERY_NODES and not do_query_nodes_check:
+        print("  [WARN] Skipping query-nodes verification (missing linkage/columns/tmp-dir).")
 
     # Phase 1: Build a complete truth index from the truth file.
     # truth_index: row_id -> set of column filenames
@@ -112,6 +141,8 @@ def verify_correctness():
     BATCH_SIZE = 50  # rows per query invocation
     passed = 0
     failed = 0
+    query_nodes_mismatches = 0
+    query_nodes_checks = 0
     errors = []
 
     for batch_start in range(0, len(selected_rows), BATCH_SIZE):
@@ -119,8 +150,8 @@ def verify_correctness():
         ids_str = ",".join(str(r) for r in batch)
         query_cmd = (
             f"{METAGRAPH_BIN} query "
-            f"{DATA_DIR}/{OUTPUT_FILE}.brwt "
-            f"{DATA_DIR}/{OUTPUT_FILE}.columns "
+            f"{brwt_file} "
+            f"{columns_file} "
             f"'{{{ids_str}}}'"
         )
         try:
@@ -129,15 +160,43 @@ def verify_correctness():
             print(f"  [ERROR] Query command failed: {e}")
             sys.exit(1)
 
-        # Parse all "Row <id>: col1 col2 ..." lines from output
-        actual_map = {}
-        for line in output.splitlines():
-            if not line.startswith("Row "):
-                continue
-            colon_idx = line.index(":")
-            rid = int(line[4:colon_idx])
-            cols_part = line[colon_idx + 1:].strip()
-            actual_map[rid] = set(cols_part.split()) if cols_part else set()
+        actual_map = parse_query_output(output)
+
+        if do_query_nodes_check:
+            query_nodes_cmd = (
+                f"{METAGRAPH_BIN} query-nodes "
+                f"{linkage_file} "
+                f"{TMP_DIR} "
+                f"{columns_file} "
+                f"'{{{ids_str}}}'"
+            )
+            try:
+                nodes_output = subprocess.check_output(query_nodes_cmd, shell=True).decode()
+            except subprocess.CalledProcessError as e:
+                print(f"  [ERROR] query-nodes command failed: {e}")
+                sys.exit(1)
+
+            nodes_map = parse_query_output(nodes_output)
+            for row_id in batch:
+                query_nodes_checks += 1
+                query_cols = actual_map.get(row_id, set())
+                node_cols = nodes_map.get(row_id, set())
+                if query_cols != node_cols:
+                    query_nodes_mismatches += 1
+                    missing = query_cols - node_cols
+                    extra = node_cols - query_cols
+                    detail = (
+                        f"Row {row_id}: query-nodes mismatch vs query "
+                        f"(query={len(query_cols)}, query-nodes={len(node_cols)})"
+                    )
+                    if missing:
+                        detail += f"; missing-from-query-nodes {len(missing)}: {sorted(missing)[:5]}"
+                    if extra:
+                        detail += f"; extra-in-query-nodes {len(extra)}: {sorted(extra)[:5]}"
+                    errors.append(detail)
+                    if len(errors) <= 10:
+                        print(f"    [FAIL] {detail}")
+                
 
         # Compare each row in this batch
         for row_id in batch:
@@ -161,7 +220,14 @@ def verify_correctness():
 
     # Phase 4: Summary
     print(f"\n  Verification Summary: {passed}/{passed + failed} rows passed")
-    if failed:
+    if do_query_nodes_check:
+        print(
+            f"  query-nodes parity: "
+            f"{query_nodes_checks - query_nodes_mismatches}/{query_nodes_checks} rows matched query"
+        )
+
+    total_failures = failed + query_nodes_mismatches
+    if total_failures:
         if len(errors) > 10:
             print(f"  (showing first 10 of {len(errors)} failures)")
         print("  CORRECTNESS CHECK FAILED!")
