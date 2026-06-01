@@ -47,6 +47,20 @@ std::string get_current_date() {
     return ss.str();
 }
 
+std::string format_time(double total_seconds) {
+    int h = static_cast<int>(total_seconds) / 3600;
+    int m = (static_cast<int>(total_seconds) % 3600) / 60;
+    double s = total_seconds - h * 3600 - m * 60;
+    std::stringstream ss;
+    ss << std::fixed << std::setprecision(2) << std::setfill('0');
+    if (h > 0) {
+        ss << h << ":" << std::setw(2) << m << ":" << std::setw(5) << s;
+    } else {
+        ss << m << ":" << std::setw(5) << s;
+    }
+    return ss.str();
+}
+
 // Parse the linkage matrix from a file.
 // Supports two formats:
 //   4-column (original build output):  c1 c2 num_ones node_id
@@ -252,25 +266,29 @@ void build_BRWT(const std::string columns_folder_path, const std::string prefix,
 
 // ─── merge ────────────────────────────────────────────────────────────────────
 
-void handle_merge(const std::string& brwt_a, const std::string& brwt_b,
+void handle_merge(const std::string& brwt_a, const std::string& cols_a,
+                  const std::string& brwt_b, const std::string& cols_b,
                   const std::string& output_prefix, size_t num_threads) {
     BRWTBottomUpBuilder::merge(brwt_a, brwt_b, output_prefix, num_threads);
 
-    // Merge .columns metadata (auto-discovered beside each .brwt file)
-    auto cols_path = [](const std::string& brwt_path) -> std::string {
-        if (brwt_path.size() > 5 && brwt_path.substr(brwt_path.size()-5) == ".brwt")
-            return brwt_path.substr(0, brwt_path.size()-5) + ".columns";
-        return brwt_path + ".columns";
-    };
-    std::string ca = cols_path(brwt_a), cb = cols_path(brwt_b);
-    auto names_a = deserialize_column_names(ca);
-    auto names_b = deserialize_column_names(cb);
+    // Merge .columns metadata from the explicitly provided column files.
+    auto names_a = deserialize_column_names(cols_a);
+    auto names_b = deserialize_column_names(cols_b);
     if (!names_a.empty() || !names_b.empty()) {
-        uint64_t offset = names_a.empty() ? 0 : (names_a.back().first + 1);
+        // Compute offset as max_column_index + 1 over all entries in names_a.
+        // We CANNOT use names_a.back().first because build_BRWT inserts column
+        // names from parallel worker threads (mutex-protected callbacks), so the
+        // insertion order is non-deterministic — back() is not the max index.
+        uint64_t offset = 0;
+        for (const auto& p : names_a)
+            if (p.first + 1 > offset) offset = p.first + 1;
         for (auto& p : names_b) names_a.emplace_back(p.first + offset, p.second);
         serialize_column_names(names_a, output_prefix + ".columns");
         logger->info("Merged .columns written to {}.columns ({} entries)",
                      output_prefix, names_a.size());
+    } else {
+        logger->warn("[merge] No .columns data found in '{}' or '{}'; output .columns not written.",
+                     cols_a, cols_b);
     }
 }
 
@@ -289,7 +307,9 @@ void handle_merge_nodes(const std::string& linkage_a_f, const std::string& node_
     auto names_a = deserialize_column_names(cols_a_f);
     auto names_b = deserialize_column_names(cols_b_f);
     if (!names_a.empty() || !names_b.empty()) {
-        uint64_t offset = names_a.empty() ? 0 : (names_a.back().first + 1);
+        uint64_t offset = 0;
+        for (const auto& p : names_a)
+            if (p.first + 1 > offset) offset = p.first + 1;
         for (auto& p : names_b) names_a.emplace_back(p.first + offset, p.second);
         std::filesystem::path out_cols = std::filesystem::path(out_node_dir).parent_path()
                                         / (std::filesystem::path(out_node_dir).filename().string() + ".columns");
@@ -526,6 +546,137 @@ void handle_query(const std::string& ids_str, const std::string& brwt_f, const s
     }
 }
 
+void handle_benchmark(const std::string& brwt_f, const std::string& cols_f) {
+    auto t_start = std::chrono::high_resolution_clock::now();
+
+    std::ifstream in(brwt_f, std::ios::binary);
+    if (!in.is_open())
+        throw std::runtime_error("benchmark: cannot open BRWT file: " + brwt_f);
+
+    BRWT brwt;
+    if (!brwt.load(in))
+        throw std::runtime_error("benchmark: failed to load BRWT from: " + brwt_f);
+
+    auto names = deserialize_column_names(cols_f);
+
+    auto t_end = std::chrono::high_resolution_clock::now();
+    double elapsed = std::chrono::duration<double>(t_end - t_start).count();
+
+    size_t rss_bytes = get_curr_RSS();
+
+    std::cout << format_time(elapsed) << ", " << rss_bytes / 1024 << "\n";
+}
+
+
+// ─── query-columns (monolithic .brwt) ────────────────────────────────────────
+// Usage: query-columns <brwtFile> <columnsFile> <outDir> --name_list <nameListFile>
+//
+// Looks up each column name in <columnsFile>, extracts its full row annotation
+// from the BRWT, and writes <outDir>/<name>.sd (sdsl::sd_vector<> binary format).
+
+void handle_query_columns(const std::string& brwt_f,
+                          const std::string& cols_f,
+                          const std::string& out_dir_s,
+                          const std::vector<std::string>& col_names) {
+    // Load the BRWT index.
+    std::ifstream in(brwt_f, std::ios::binary);
+    if (!in.is_open())
+        throw std::runtime_error("query-columns: cannot open BRWT file: " + brwt_f);
+    BRWT brwt;
+    if (!brwt.load(in))
+        throw std::runtime_error("query-columns: failed to load BRWT from: " + brwt_f);
+    logger->info("[query-columns] Loaded {} columns, {} rows from {}",
+                 brwt.num_columns(), brwt.num_rows(), brwt_f);
+
+    // Build name → column_id map from the .columns file.
+    auto all_names = deserialize_column_names(cols_f);
+    std::unordered_map<std::string, uint64_t> name_to_id;
+    for (const auto& [cid, cname] : all_names)
+        name_to_id[cname] = cid;
+
+    // Resolve each requested name.
+    std::vector<std::pair<uint64_t, std::string>> requests;
+    for (const auto& name : col_names) {
+        auto it = name_to_id.find(name);
+        if (it == name_to_id.end()) {
+            logger->warn("[query-columns] Column '{}' not found in .columns file, skipping.", name);
+            continue;
+        }
+        requests.emplace_back(it->second, name);
+    }
+
+    if (requests.empty()) {
+        logger->warn("[query-columns] No valid column names resolved.");
+        return;
+    }
+
+    BRWTBottomUpBuilder::query_columns(brwt, requests, out_dir_s);
+    logger->info("[query-columns] Done. {} columns written to {}", requests.size(), out_dir_s);
+}
+
+// ─── query-columns-nodes (node-folder format) ─────────────────────────────────
+// Usage: query-columns-nodes <linkageFile> <nodeDir> <columnsFile> <outDir>
+//                            --name_list <nameListFile>
+//
+// Same as query-columns but operates on the node-folder format produced by
+// `build --no-assemble`.  No assembly step is required.
+
+void handle_query_columns_nodes(const std::string& linkage_f,
+                                const std::string& node_dir_s,
+                                const std::string& cols_f,
+                                const std::string& out_dir_s,
+                                const std::vector<std::string>& col_names) {
+    auto linkage = parse_linkage_matrix(linkage_f);
+    if (linkage.empty())
+        throw std::runtime_error("query-columns-nodes: empty or invalid linkage: " + linkage_f);
+
+    // Build name → column_id map.
+    auto all_names = deserialize_column_names(cols_f);
+    std::unordered_map<std::string, uint64_t> name_to_id;
+    for (const auto& [cid, cname] : all_names)
+        name_to_id[cname] = cid;
+
+    std::vector<std::pair<uint64_t, std::string>> requests;
+    for (const auto& name : col_names) {
+        auto it = name_to_id.find(name);
+        if (it == name_to_id.end()) {
+            logger->warn("[query-columns-nodes] Column '{}' not found in .columns file, skipping.", name);
+            continue;
+        }
+        requests.emplace_back(it->second, name);
+    }
+
+    if (requests.empty()) {
+        logger->warn("[query-columns-nodes] No valid column names resolved.");
+        return;
+    }
+
+    BRWTBottomUpBuilder::query_columns_nodes(requests, linkage, node_dir_s, out_dir_s);
+    logger->info("[query-columns-nodes] Done. {} columns written to {}", requests.size(), out_dir_s);
+}
+
+// ─── root-append (monolithic .brwt) ───────────────────────────────────────────
+// Extends the BRWT matrix by appending (target_len - num_rows) zero rows at the
+// end, writing the result to a new .brwt file.
+
+void handle_root_append(const std::string& input_brwt,
+                        uint64_t target_len,
+                        const std::string& output_brwt) {
+    BRWTBottomUpBuilder::root_append(input_brwt, target_len, output_brwt);
+}
+
+// ─── root-append-nodes (node-folder format) ────────────────────────────────────
+// Same as root-append but operates on the node-folder format.
+// Backs up <root_id> as ori_node_<root_id> then overwrites <root_id>.
+
+void handle_root_append_nodes(const std::string& linkage_f,
+                              const std::string& node_dir_s,
+                              uint64_t target_len) {
+    auto linkage = parse_linkage_matrix(linkage_f);
+    if (linkage.empty())
+        throw std::runtime_error("root-append-nodes: empty or invalid linkage: " + linkage_f);
+    BRWTBottomUpBuilder::root_append_nodes(linkage, node_dir_s, target_len);
+}
 
 void show_usage(const std::string& program_name) {
     std::cerr << "Multi-BRWT Optimized Build Tool (Adaptive Strategy Engine)\n"
@@ -544,9 +695,10 @@ void show_usage(const std::string& program_name) {
               << "        --no-assemble         Finish merges and exit without creating final single file.\n\n"
               << "  assemble <linkageFile> <nodeDir> <outputFile>\n"
               << "      Stitch existing nodes from nodeDir into a single .brwt file.\n\n"
-              << "  merge <brwtFileA> <brwtFileB> <outputPrefix> [--threads <N>]\n"
+              << "  merge <brwtFileA> <columnFileA> <brwtFileB> <columnFileB> <outputPrefix> [--threads <N>]\n"
               << "      Merge two monolithic .brwt files (same row length) into one.\n"
-              << "      Auto-discovers <prefix>.columns beside each .brwt and merges them.\n\n"
+              << "      Both .columns files must be provided explicitly; the merged result is written\n"
+              << "      to <outputPrefix>.brwt and <outputPrefix>.columns.\n\n"
               << "  merge-nodes <linkageA> <nodeDirA> <linkageB> <nodeDirB> <outNodeDir> <outLinkage> [flags]\n"
               << "      Merge two node-folder BRWT representations (same row length) into one.\n"
               << "      Flags:\n"
@@ -566,9 +718,26 @@ void show_usage(const std::string& program_name) {
               << "      <columnsFile>  : column-name index file (.columns).\n"
               << "      <rowIds>       : comma-separated row IDs (e.g., \"0,100,50084136181\").\n"
               << "      --log          : print query stats (nodes loaded, hits, etc.) to stderr.\n\n"
+              << "  query-columns <brwtFile> <columnsFile> <outDir> --name_list <nameListFile>\n"
+              << "      Extract column annotations from a monolithic .brwt file.\n"
+              << "      Each named column is written as <outDir>/<name>.sd (sdsl::sd_vector format).\n"
+              << "      <nameListFile> : plain-text file with one column name per line.\n\n"
+              << "  query-columns-nodes <linkageFile> <nodeDir> <columnsFile> <outDir> --name_list <nameListFile>\n"
+              << "      Extract column annotations from a node-folder BRWT (no assembly needed).\n"
+              << "      Each named column is written as <outDir>/<name>.sd (sdsl::sd_vector format).\n"
+              << "      <nameListFile> : plain-text file with one column name per line.\n\n"
+              << "  root-append <inputBrwt> <targetLen> <outputBrwt>\n"
+              << "      Extend a monolithic .brwt matrix to targetLen rows by appending zeros.\n"
+              << "      Writes a new .brwt file; input is unchanged.\n\n"
+              << "  root-append-nodes <linkageFile> <nodeDir> <targetLen>\n"
+              << "      Extend a node-folder BRWT matrix to targetLen rows by appending zeros.\n"
+              << "      Backs up original root as ori_node_<root_id>; overwrites <root_id>.\n\n"
               << "  server <brwtFile> <columnsFile> [--port <P>]\n"
-              << "      Start a REST API server for row queries.\n";
+              << "      Start a REST API server for row queries.\n\n"
+              << "  benchmark <brwtFile> <columnsFile>\n"
+              << "      Load BRWT and columns file to measure loading time and RAM usage.\n";
 }
+
 
 } // namespace
 
@@ -598,12 +767,12 @@ int main(int argc, char* argv[]) {
             }
             handle_build(dir, pre, out, tmp, "", threads, full_nodes, partial_nodes, 0, 42, trivial, resume, assemble);
         } else if (cmd == "merge") {
-            // merge <brwtA> <brwtB> <outputPrefix> [--threads <N>]
-            if (argc < 5) { show_usage(argv[0]); return 1; }
+            // merge <brwtA> <columnFileA> <brwtB> <columnFileB> <outputPrefix> [--threads <N>]
+            if (argc < 7) { show_usage(argv[0]); return 1; }
             size_t threads = std::thread::hardware_concurrency();
-            for (int i = 5; i < argc; ++i)
+            for (int i = 7; i < argc; ++i)
                 if (std::string(argv[i]) == "--threads" && i+1 < argc) threads = std::stoul(argv[++i]);
-            handle_merge(argv[2], argv[3], argv[4], threads);
+            handle_merge(argv[2], argv[3], argv[4], argv[5], argv[6], threads);
         } else if (cmd == "merge-nodes") {
             // merge-nodes <linkA> <ndirA> <linkB> <ndirB> <outDir> <outLinkage> [flags]
             if (argc < 8) { show_usage(argv[0]); return 1; }
@@ -667,6 +836,46 @@ int main(int argc, char* argv[]) {
                 if (std::string(argv[i]) == "--log") log_stats = true;
             }
             handle_query_nodes(argv[2], argv[3], argv[4], argv[5], log_stats);
+        } else if (cmd == "query-columns") {
+            // query-columns <brwtFile> <columnsFile> <outDir> --name_list <nameListFile>
+            if (argc < 6) { show_usage(argv[0]); return 1; }
+            std::string name_list_file;
+            for (int i = 5; i < argc; ++i) {
+                if (std::string(argv[i]) == "--name_list" && i + 1 < argc)
+                    name_list_file = argv[++i];
+            }
+            if (name_list_file.empty()) {
+                std::cerr << "Error: query-columns requires --name_list <file>\n";
+                show_usage(argv[0]); return 1;
+            }
+            std::vector<std::string> col_names;
+            { std::ifstream lf(name_list_file); if (!lf.is_open()) throw std::runtime_error("Cannot open name list: " + name_list_file);
+              std::string ln; while (std::getline(lf, ln)) if (!ln.empty()) col_names.push_back(ln); }
+            handle_query_columns(argv[2], argv[3], argv[4], col_names);
+        } else if (cmd == "query-columns-nodes") {
+            // query-columns-nodes <linkageFile> <nodeDir> <columnsFile> <outDir> --name_list <nameListFile>
+            if (argc < 7) { show_usage(argv[0]); return 1; }
+            std::string name_list_file;
+            for (int i = 6; i < argc; ++i) {
+                if (std::string(argv[i]) == "--name_list" && i + 1 < argc)
+                    name_list_file = argv[++i];
+            }
+            if (name_list_file.empty()) {
+                std::cerr << "Error: query-columns-nodes requires --name_list <file>\n";
+                show_usage(argv[0]); return 1;
+            }
+            std::vector<std::string> col_names;
+            { std::ifstream lf(name_list_file); if (!lf.is_open()) throw std::runtime_error("Cannot open name list: " + name_list_file);
+              std::string ln; while (std::getline(lf, ln)) if (!ln.empty()) col_names.push_back(ln); }
+            handle_query_columns_nodes(argv[2], argv[3], argv[4], argv[5], col_names);
+        } else if (cmd == "root-append") {
+            // root-append <inputBrwt> <targetLen> <outputBrwt>
+            if (argc < 5) { show_usage(argv[0]); return 1; }
+            handle_root_append(argv[2], std::stoull(argv[3]), argv[4]);
+        } else if (cmd == "root-append-nodes") {
+            // root-append-nodes <linkageFile> <nodeDir> <targetLen>
+            if (argc < 5) { show_usage(argv[0]); return 1; }
+            handle_root_append_nodes(argv[2], argv[3], std::stoull(argv[4]));
         } else if (cmd == "server") {
             if (argc < 4) {
                 show_usage(argv[0]);
@@ -679,6 +888,9 @@ int main(int argc, char* argv[]) {
                 if (std::string(argv[i]) == "--port" && i+1 < argc) port = std::stoul(argv[++i]);
             }
             handle_server(brwt_f, cols_f, port);
+        } else if (cmd == "benchmark") {
+            if (argc < 4) { show_usage(argv[0]); return 1; }
+            handle_benchmark(argv[2], argv[3]);
         } else {
             show_usage(argv[0]);
             return 1;

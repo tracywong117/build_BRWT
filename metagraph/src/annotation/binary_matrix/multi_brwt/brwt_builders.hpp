@@ -89,6 +89,38 @@ class BRWTBottomUpBuilder {
                 const std::vector<std::vector<uint64_t>>& linkage,
                 const std::filesystem::path& node_dir,
                 bool log_stats = false);
+
+    // Extract column bit-vectors from a monolithic .brwt file and write each
+    // as an sdsl::sd_vector<> to out_dir/<name>.sd.
+    // col_requests: pairs of (column_id, output_filename_stem)
+    static void query_columns(const BRWT &brwt,
+                              const std::vector<std::pair<uint64_t, std::string>> &col_requests,
+                              const std::filesystem::path &out_dir);
+
+    // Extract column bit-vectors from a node-folder BRWT (no-assemble format)
+    // by walking root→leaf along the linkage tree and composing sub-indices.
+    // col_requests: pairs of (column_id, output_filename_stem)
+    static void query_columns_nodes(
+                              const std::vector<std::pair<uint64_t, std::string>> &col_requests,
+                              const std::vector<std::vector<uint64_t>> &linkage,
+                              const std::filesystem::path &node_dir,
+                              const std::filesystem::path &out_dir);
+
+    // Extend the BRWT matrix by appending (target_len - num_rows) zero rows at
+    // the end.  Only the root's nonzero_rows_ changes; child sub-indices are
+    // rank-based and need no modification.
+    //
+    // root_append: monolithic .brwt — loads full tree, writes new .brwt file.
+    static void root_append(const std::filesystem::path &input_brwt,
+                            uint64_t target_len,
+                            const std::filesystem::path &output_brwt);
+
+    // root_append_nodes: node-folder format — touches only the root file.
+    //   Backup: <root_id>  →  ori_node_<root_id>
+    //   New root written to <root_id> (atomic via .partial).
+    static void root_append_nodes(const std::vector<std::vector<uint64_t>> &linkage,
+                                  const std::filesystem::path &node_dir,
+                                  uint64_t target_len);
 };
 
 

@@ -193,6 +193,347 @@ BRWTBottomUpBuilder::query_nodes(const std::vector<uint64_t>& row_ids,
     return results;
 }
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ─── query_columns (monolithic .brwt) ────────────────────────────────────────
+//
+// Given a loaded BRWT and a set of column IDs, extracts each column's set-bit
+// positions and writes them as sdsl::sd_vector<> files to `out_dir`.
+//
+// Output file per column: <out_dir>/<col_id>.sd
+// The caller supplies the column_id → filename mapping so it can write
+// human-readable names instead of numeric IDs if desired.
+
+void BRWTBottomUpBuilder::query_columns(
+        const BRWT &brwt,
+        const std::vector<std::pair<uint64_t, std::string>> &col_requests,
+        const std::filesystem::path &out_dir) {
+
+    std::filesystem::create_directories(out_dir);
+    uint64_t num_rows = brwt.num_rows();
+
+    for (const auto &[col_id, out_name] : col_requests) {
+        if (col_id >= brwt.num_columns()) {
+            logger->warn("[query-columns] column id {} out of range (tree has {} columns), skipping.",
+                         col_id, brwt.num_columns());
+            continue;
+        }
+
+        // get_column() returns sorted absolute row indices where col_id is set.
+        std::vector<BRWT::Row> rows = brwt.get_column(col_id);
+
+        // Build sdsl::sd_vector<> from the sorted row list.
+        sdsl::sd_vector_builder builder(num_rows, rows.size());
+        for (uint64_t r : rows) builder.set(r);
+        sdsl::sd_vector<> sdvec(builder);
+
+        std::filesystem::path out_path = out_dir / (out_name + ".sd");
+        std::ofstream out(out_path, std::ios::binary);
+        if (!out.is_open()) {
+            logger->error("[query-columns] Cannot write output file: {}", out_path.string());
+            continue;
+        }
+        sdsl::serialize(sdvec, out);
+        out.close();
+        logger->info("[query-columns] Written {} set bits → {}", rows.size(), out_path.string());
+    }
+}
+
+// ─── query_columns_nodes (node-folder format) ─────────────────────────────────
+//
+// Extracts a column's full row bit-vector from a BRWT stored as a node folder
+// (the on-disk format produced by build --no-assemble) without assembling the
+// full tree into RAM.
+//
+// Disk layout expected in node_dir:
+//   <root_id>      — root's union bit-vector (BRWT file, size = num_rows)
+//   node_<id>      — every other node's sub-index (size = parent's set-bit count)
+//
+// Algorithm (for one target column):
+//   1. Walk the linkage tree from root → target leaf, loading each node's BRWT
+//      file to read its `assignments_` (to route to the right child).
+//   2. Collect the sub-index bit-vectors along the path:
+//        path_bvs = [root_bv, depth1_bv, ..., leaf_bv]
+//   3. Start with the leaf's set bits as 0-indexed ranks within the leaf's parent.
+//   4. Compose upward: at each level map ranks → positions via select1(), giving
+//      ranks in the level above, until the root maps them to absolute row indices.
+//   5. Build and serialize sdsl::sd_vector<> from the resulting sorted row list.
+
+void BRWTBottomUpBuilder::query_columns_nodes(
+        const std::vector<std::pair<uint64_t, std::string>> &col_requests,
+        const std::vector<std::vector<uint64_t>> &linkage,
+        const std::filesystem::path &node_dir,
+        const std::filesystem::path &out_dir) {
+
+    if (linkage.empty()) {
+        logger->error("[query-columns-nodes] Empty linkage.");
+        return;
+    }
+    std::filesystem::create_directories(out_dir);
+
+    uint64_t root_id = static_cast<uint64_t>(linkage.size()) - 1;
+
+    // Helper: load a BRWT node file from disk.
+    // Root lives in node_dir/<root_id>; all others in node_dir/node_<id>.
+    auto load_node = [&](uint64_t id) -> BRWT {
+        std::filesystem::path p = (id == root_id)
+            ? node_dir / std::to_string(id)
+            : node_dir / ("node_" + std::to_string(id));
+        std::ifstream in(p, std::ios::binary);
+        if (!in.is_open()) {
+            logger->error("[query-columns-nodes] Cannot open node file: {}", p.string());
+            exit(1);
+        }
+        BRWT node;
+        if (!node.load(in)) {
+            logger->error("[query-columns-nodes] Failed to load node from: {}", p.string());
+            exit(1);
+        }
+        return node;
+    };
+
+    // Load root once — used for every column query.
+    BRWT root = load_node(root_id);
+    uint64_t num_rows = root.num_rows();
+
+    for (const auto &[col_id, out_name] : col_requests) {
+        // ── 1. Walk root → leaf, collecting path sub-index bit-vectors ────────
+        // path_bvs[0] = root's union bv (size = num_rows)
+        // path_bvs[1] = child's sub-index (size = root's set-bit count)
+        // path_bvs[d] = node at depth d's sub-index (size = parent's set-bit count)
+        std::vector<std::unique_ptr<bit_vector>> path_bvs;
+
+        // Start at root (already loaded above); track column rank in current node.
+        path_bvs.push_back(root.nonzero_rows_->copy());
+
+        uint64_t col_in_node = col_id;
+        uint64_t cur_id      = root_id;
+
+        // We need cur_node's assignments_ to route down.  For root we have it;
+        // for subsequent levels we load the child we just descended into.
+        const BRWT *cur_ptr = &root;   // points to the current node's BRWT
+        BRWT cur_loaded;               // owns the node when cur_id != root_id
+
+        bool valid = true;
+        while (!linkage[cur_id].empty()) {
+            if (col_in_node >= cur_ptr->num_columns()) {
+                logger->warn("[query-columns-nodes] col {} out of range at node {}, skipping.",
+                             col_in_node, cur_id);
+                valid = false;
+                break;
+            }
+
+            // Route: which child group holds col_in_node, and what rank within it?
+            uint64_t child_group  = cur_ptr->assignments_.group(col_in_node);
+            uint64_t col_in_child = cur_ptr->assignments_.rank(col_in_node);
+            uint64_t child_id     = linkage[cur_id][child_group];
+
+            // Descend: load the child node.
+            cur_loaded  = load_node(child_id);
+            cur_ptr     = &cur_loaded;
+            cur_id      = child_id;
+            col_in_node = col_in_child;
+
+            path_bvs.push_back(cur_ptr->nonzero_rows_->copy());
+        }
+
+        if (!valid) continue;
+
+        // ── 2. Start with the leaf's set bit positions (ranks in parent space) ──
+        // The leaf's nonzero_rows_ is the sub-index: bit r is set when parent's
+        // r-th set row has this column set.  call_ones() gives those r values.
+        std::vector<uint64_t> rows;
+        path_bvs.back()->call_ones([&](uint64_t r) { rows.push_back(r); });
+
+        // ── 3. Compose upward: at each ancestor level, map ranks → positions ──
+        // We go from depth (D-1) up to depth 0 (root).
+        // At depth d, path_bvs[d]->select1(r+1) maps rank r in depth-d space
+        // to a position in depth-(d-1) space (or absolute if d==0).
+        for (int d = static_cast<int>(path_bvs.size()) - 2; d >= 0; --d) {
+            const auto &bv = *path_bvs[d];
+            // If this bv is all-ones (set-bit count == size), select1 is identity.
+            if (bv.num_set_bits() == bv.size()) continue;
+            for (uint64_t &r : rows)
+                r = bv.select1(r + 1);  // map rank (0-indexed) → position
+        }
+
+        // `rows` now contains absolute row indices, already sorted.
+
+        // ── 4. Build and write sdsl::sd_vector<> ─────────────────────────────
+        sdsl::sd_vector_builder builder(num_rows, rows.size());
+        for (uint64_t r : rows) builder.set(r);
+        sdsl::sd_vector<> sdvec(builder);
+
+        std::filesystem::path out_path = out_dir / (out_name + ".sd");
+        std::ofstream out(out_path, std::ios::binary);
+        if (!out.is_open()) {
+            logger->error("[query-columns-nodes] Cannot write: {}", out_path.string());
+            continue;
+        }
+        sdsl::serialize(sdvec, out);
+        out.close();
+        logger->info("[query-columns-nodes] col_id={} → {} set bits → {}",
+                     col_id, rows.size(), out_path.string());
+    }
+}
+
+
+// ─── root_append (monolithic .brwt) ──────────────────────────────────────────
+//
+// Extends the BRWT matrix by appending (target_len - num_rows) zero rows at the
+// end.  Only the root node's union bit-vector grows; all child sub-indices are
+// stored as rank-indexed bitmaps relative to the root's set-bit count, so they
+// are unaffected by adding trailing zeros to the root.
+//
+// Steps:
+//   1. Load the full BRWT tree from input_brwt.
+//   2. Replace root's nonzero_rows_ with a new bit_vector_smallrank of size
+//      target_len that has the same set bits at the same positions.
+//   3. Serialize the entire tree to output_brwt.
+
+void BRWTBottomUpBuilder::root_append(const std::filesystem::path &input_brwt,
+                                      uint64_t target_len,
+                                      const std::filesystem::path &output_brwt) {
+    // ── 1. Load the full BRWT ─────────────────────────────────────────────────
+    BRWT brwt;
+    {
+        std::ifstream in(input_brwt, std::ios::binary);
+        if (!in.is_open())
+            throw std::runtime_error("root-append: cannot open input: " + input_brwt.string());
+        if (!brwt.load(in))
+            throw std::runtime_error("root-append: failed to load BRWT from: " + input_brwt.string());
+    }
+
+    uint64_t current_len = brwt.num_rows();
+    logger->info("[root-append] Loaded {} columns, {} rows from {}",
+                 brwt.num_columns(), current_len, input_brwt.string());
+
+    if (target_len < current_len)
+        throw std::runtime_error(
+            "root-append: target_len (" + std::to_string(target_len) +
+            ") is smaller than current num_rows (" + std::to_string(current_len) + ")");
+
+    if (target_len == current_len) {
+        logger->warn("[root-append] target_len == current num_rows, nothing to do.");
+        return;
+    }
+
+    // ── 2. Extend root's nonzero_rows_ ───────────────────────────────────────
+    // Build a new sdsl::bit_vector of size target_len, copy existing set bits.
+    {
+        sdsl::bit_vector new_bv(target_len, 0);
+        brwt.nonzero_rows_->call_ones([&](uint64_t pos) { new_bv[pos] = 1; });
+        brwt.nonzero_rows_ = std::make_unique<bit_vector_smallrank>(std::move(new_bv));
+    }
+
+    logger->info("[root-append] Extended root to {} rows (added {} zero rows).",
+                 target_len, target_len - current_len);
+
+    // ── 3. Serialize to output file ───────────────────────────────────────────
+    {
+        std::filesystem::path partial = output_brwt.string() + ".partial";
+        std::ofstream out(partial, std::ios::binary);
+        if (!out.is_open())
+            throw std::runtime_error("root-append: cannot write output: " + output_brwt.string());
+        brwt.serialize(out);
+        out.close();
+        std::filesystem::rename(partial, output_brwt);
+    }
+
+    logger->info("[root-append] Written to {}", output_brwt.string());
+}
+
+// ─── root_append_nodes (node-folder format) ───────────────────────────────────
+//
+// Same semantics as root_append but operates on the node-folder format produced
+// by `build --no-assemble`, touching only the single root file.
+//
+// Disk layout changes in node_dir:
+//   Before:  <root_id>                — root union bit-vector (original)
+//   After:   ori_node_<root_id>       — backup of original root (hard-link or copy)
+//            <root_id>               — new extended root (atomic rename via .partial)
+//
+// Child files (node_<id>) are NOT touched.
+
+void BRWTBottomUpBuilder::root_append_nodes(const std::vector<std::vector<uint64_t>> &linkage,
+                                            const std::filesystem::path &node_dir,
+                                            uint64_t target_len) {
+    if (linkage.empty())
+        throw std::runtime_error("root-append-nodes: empty linkage");
+
+    uint64_t root_id = static_cast<uint64_t>(linkage.size()) - 1;
+    std::filesystem::path root_path  = node_dir / std::to_string(root_id);
+    std::filesystem::path backup_path = node_dir / ("ori_node_" + std::to_string(root_id));
+
+    // ── 1. Load root file ─────────────────────────────────────────────────────
+    // The root file is a BRWT serialized without children (child_nodes_ cleared
+    // before writing by dump_node / save_node in the build loop).
+    BRWT root;
+    {
+        std::ifstream in(root_path, std::ios::binary);
+        if (!in.is_open())
+            throw std::runtime_error("root-append-nodes: cannot open root file: " + root_path.string());
+        if (!root.load(in))
+            throw std::runtime_error("root-append-nodes: failed to load root from: " + root_path.string());
+    }
+
+    uint64_t current_len = root.num_rows();
+    logger->info("[root-append-nodes] Loaded root (id={}) — {} rows, {} set bits.",
+                 root_id, current_len,
+                 root.nonzero_rows_ ? root.nonzero_rows_->num_set_bits() : 0);
+
+    if (target_len < current_len)
+        throw std::runtime_error(
+            "root-append-nodes: target_len (" + std::to_string(target_len) +
+            ") is smaller than current num_rows (" + std::to_string(current_len) + ")");
+
+    if (target_len == current_len) {
+        logger->warn("[root-append-nodes] target_len == current num_rows, nothing to do.");
+        return;
+    }
+
+    // ── 2. Backup original root as ori_node_<root_id> ─────────────────────────
+    // Try hard-link first (instant, no extra disk space); fall back to copy.
+    if (std::filesystem::exists(backup_path)) {
+        logger->warn("[root-append-nodes] Backup {} already exists, overwriting.", backup_path.string());
+        std::filesystem::remove(backup_path);
+    }
+    {
+        std::error_code ec;
+        std::filesystem::create_hard_link(root_path, backup_path, ec);
+        if (ec) {
+            std::filesystem::copy_file(root_path, backup_path,
+                                       std::filesystem::copy_options::overwrite_existing);
+        }
+    }
+    logger->info("[root-append-nodes] Original root backed up to {}", backup_path.string());
+
+    // ── 3. Extend root's nonzero_rows_ ───────────────────────────────────────
+    {
+        sdsl::bit_vector new_bv(target_len, 0);
+        root.nonzero_rows_->call_ones([&](uint64_t pos) { new_bv[pos] = 1; });
+        root.nonzero_rows_ = std::make_unique<bit_vector_smallrank>(std::move(new_bv));
+    }
+
+    logger->info("[root-append-nodes] Extended root to {} rows (added {} zero rows).",
+                 target_len, target_len - current_len);
+
+    // ── 4. Write new root to <root_id> (atomic rename) ───────────────────────
+    {
+        std::filesystem::path partial = root_path.string() + ".partial";
+        std::ofstream out(partial, std::ios::binary);
+        if (!out.is_open())
+            throw std::runtime_error("root-append-nodes: cannot write new root: " + partial.string());
+        root.child_nodes_.clear();   // node-folder format stores no children in the file
+        root.serialize(out);
+        out.close();
+        std::filesystem::rename(partial, root_path);
+    }
+
+    logger->info("[root-append-nodes] New root written to {}", root_path.string());
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -1171,7 +1512,13 @@ void BRWTOptimizer::relax_nodes(std::vector<std::vector<uint64_t>> &linkage,
                  "max depth {}, max_arity limit {}",
                  num_nodes, total_internal, total_leaves, max_depth, max_arity);
 
-    // ── 2. load_node / save_node (support both bare <id> and node_<id>) ───────
+    // ── 2. load_node / save_node ─────────────────────────────────────────────
+    // After build completes, the disk layout is:
+    //   <root_id>      — root's union bit-vector (only file for root)
+    //   node_<id>      — sub-index for every other internal node
+    // The <id> union-bv files for non-root nodes are deleted by the build loop
+    // once their parent is saved, so there is never ambiguity: only one of the
+    // two paths exists for any given node.
     auto load_node = [&](uint64_t id) {
         BRWT node;
         auto path_bare     = node_dir / std::to_string(id);
@@ -1198,13 +1545,19 @@ void BRWTOptimizer::relax_nodes(std::vector<std::vector<uint64_t>> &linkage,
         return node;
     };
 
+    // Only root node has a union bit-vector file named <id>; 
+    // all other nodes have sub-index files named node_<id>.
     auto save_node = [&](BRWT& node, uint64_t id) {
-        auto path_bare     = node_dir / std::to_string(id);
-        auto path_prefixed = node_dir / ("node_" + std::to_string(id));
-        std::filesystem::path target = std::filesystem::exists(path_bare)
-                                     ? path_bare : path_prefixed;
+        bool is_root = (id == num_nodes - 1);
+        std::filesystem::path target = is_root
+            ? node_dir / std::to_string(id)
+            : node_dir / ("node_" + std::to_string(id));
         std::string partial_name = target.string() + ".partial";
         std::ofstream out(partial_name, std::ios::binary);
+        if (!out.is_open()) {
+            logger->error("relax_nodes: cannot write node {}: {}", id, partial_name);
+            exit(1);
+        }
         node.child_nodes_.clear();
         node.serialize(out);
         out.close();
@@ -1230,7 +1583,14 @@ void BRWTOptimizer::relax_nodes(std::vector<std::vector<uint64_t>> &linkage,
         // populated so that should_prune() — which checks child.child_nodes_.size() > 0
         // and calls pruning_delta() on child's children — can evaluate correctly.
         // This matches what relax() sees naturally in the fully in-memory tree.
+        //
+        // BUG FIX: maintain a parallel child_ids vector that mirrors parent.child_nodes_
+        // exactly throughout the pruning loop.  reassign() appends grandchildren at the
+        // *end* of parent.child_nodes_, while linkage[p_id] splices them at position g.
+        // Without the parallel vector the final save loop used linkage[p_id][g] to name
+        // child_nodes_[g], which were in different orders after the first prune.
         parent.child_nodes_.resize(linkage[p_id].size());
+        std::vector<uint64_t> child_ids(linkage[p_id]); // parallel ID list
         for (size_t g = 0; g < linkage[p_id].size(); ++g) {
             uint64_t c_id = linkage[p_id][g];
             auto child_brwt = std::make_unique<BRWT>(load_node(c_id));
@@ -1246,7 +1606,7 @@ void BRWTOptimizer::relax_nodes(std::vector<std::vector<uint64_t>> &linkage,
         // Try to prune each child (iterate backwards so erases don't shift indices)
         for (int g = (int)parent.child_nodes_.size() - 1; g >= 0; --g) {
             BRWT* child   = dynamic_cast<BRWT*>(parent.child_nodes_[g].get());
-            uint64_t c_id = linkage[p_id][g];
+            uint64_t c_id = child_ids[g]; // use parallel vector, not linkage (already updated)
 
             if (child && !linkage[c_id].empty() && should_prune(*child)
                 && parent.child_nodes_.size() - 1 + linkage[c_id].size() <= max_arity) {
@@ -1255,11 +1615,23 @@ void BRWTOptimizer::relax_nodes(std::vector<std::vector<uint64_t>> &linkage,
                 size_t child_arity    = linkage[c_id].size();
                 std::vector<uint64_t> grandchildren_ids = linkage[c_id];
 
+                // reassign() erases slot g from child_nodes_ then appends
+                // grandchildren at the end.  Mirror that exactly in child_ids.
+                size_t n_before = parent.child_nodes_.size(); // before reassign
                 reassign(g, &parent, num_threads);
+                // child_nodes_ now has (n_before - 1 + grandchildren_ids.size()) entries;
+                // grandchildren were appended starting at (n_before - 1).
+                child_ids.erase(child_ids.begin() + g);
+                for (size_t h = 0; h < grandchildren_ids.size(); ++h)
+                    child_ids.push_back(grandchildren_ids[h]);
 
+                // Update linkage in the same structural way so should_prune
+                // on later iterations sees the correct grandchild set.
+                // MUST match child_ids (append at end) because reassign() appends to the end
+                // and parent->assignments_ is recomputed based on that order.
                 linkage[p_id].erase(linkage[p_id].begin() + g);
-                linkage[p_id].insert(linkage[p_id].begin() + g,
-                                     grandchildren_ids.begin(), grandchildren_ids.end());
+                for (uint64_t gc_id : grandchildren_ids)
+                    linkage[p_id].push_back(gc_id);
 
                 // Delete the pruned intermediate node from disk (try both names)
                 std::error_code ec;
@@ -1276,8 +1648,10 @@ void BRWTOptimizer::relax_nodes(std::vector<std::vector<uint64_t>> &linkage,
         }
 
         if (changed) {
-            for (size_t g = 0; g < linkage[p_id].size(); ++g)
-                save_node(*parent.child_nodes_[g], linkage[p_id][g]);
+            // Use child_ids (mirrors child_nodes_ ordering) NOT linkage[p_id]
+            // (which has grandchildren spliced at position g, not at the end).
+            for (size_t g = 0; g < child_ids.size(); ++g)
+                save_node(*parent.child_nodes_[g], child_ids[g]);
             save_node(parent, p_id);
 
             // size_t arity_after = linkage[p_id].size();
