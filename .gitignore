@@ -53,3 +53,6 @@ send.sh
 query_nodes_result.txt
 query_result.txt
 bak/
+test/benchmark*
+test/test_merge_data
+test/test_relax_data

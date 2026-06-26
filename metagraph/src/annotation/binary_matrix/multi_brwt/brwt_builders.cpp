@@ -11,6 +11,7 @@
 #include "common/utils/file_utils.hpp"
 #include "common/vectors/vector_algorithm.hpp"
 #include "common/unix_tools.hpp"
+#include "common/serialization.hpp"
 
 
 namespace mtg {
@@ -1131,20 +1132,42 @@ void BRWTBottomUpBuilder::merge(const std::filesystem::path &brwt_a,
                                 const std::filesystem::path &brwt_b,
                                 const std::filesystem::path &output_prefix,
                                 size_t num_threads) {
-    logger->info("[merge] Loading Tree A from {}", brwt_a.string());
+    logger->info("[merge] Loading Tree A Root from {}", brwt_a.string());
     BRWT tree_a;
+    size_t num_child_nodes_a = 0;
+    std::streampos subtree_offset_a;
     {
         std::ifstream in(brwt_a, std::ios::binary);
-        if (!in.is_open() || !tree_a.load(in))
-            throw std::runtime_error("merge: cannot load BRWT A: " + brwt_a.string());
+        if (!in.is_open())
+            throw std::runtime_error("merge: cannot open BRWT A: " + brwt_a.string());
+
+        if (!tree_a.assignments_.load(in))
+            throw std::runtime_error("merge: cannot load assignments of A");
+
+        if (!tree_a.nonzero_rows_->load(in))
+            throw std::runtime_error("merge: cannot load nonzero_rows of A");
+
+        num_child_nodes_a = load_number(in);
+        subtree_offset_a = in.tellg();
     }
 
-    logger->info("[merge] Loading Tree B from {}", brwt_b.string());
+    logger->info("[merge] Loading Tree B Root from {}", brwt_b.string());
     BRWT tree_b;
+    size_t num_child_nodes_b = 0;
+    std::streampos subtree_offset_b;
     {
         std::ifstream in(brwt_b, std::ios::binary);
-        if (!in.is_open() || !tree_b.load(in))
-            throw std::runtime_error("merge: cannot load BRWT B: " + brwt_b.string());
+        if (!in.is_open())
+            throw std::runtime_error("merge: cannot open BRWT B: " + brwt_b.string());
+
+        if (!tree_b.assignments_.load(in))
+            throw std::runtime_error("merge: cannot load assignments of B");
+
+        if (!tree_b.nonzero_rows_->load(in))
+            throw std::runtime_error("merge: cannot load nonzero_rows of B");
+
+        num_child_nodes_b = load_number(in);
+        subtree_offset_b = in.tellg();
     }
 
     if (tree_a.num_rows() != tree_b.num_rows())
@@ -1152,30 +1175,37 @@ void BRWTBottomUpBuilder::merge(const std::filesystem::path &brwt_a,
             "merge: row length mismatch: A=" + std::to_string(tree_a.num_rows()) +
             " B=" + std::to_string(tree_b.num_rows()));
 
-    logger->info("[merge] Merging {} cols + {} cols ({} rows)",
+    logger->info("[merge] Merging {} cols + {} cols ({} rows) [Root-Only mode]",
                  tree_a.num_columns(), tree_b.num_columns(), tree_a.num_rows());
 
-    // Estimate density to pick concatenate() strategy.
+    // Perform root level merge (OR the two root vectors)
     uint64_t num_rows = tree_a.num_rows();
-    uint64_t ones_a = tree_a.nonzero_rows_ ? tree_a.nonzero_rows_->num_set_bits() : 0;
-    uint64_t ones_b = tree_b.nonzero_rows_ ? tree_b.nonzero_rows_->num_set_bits() : 0;
-    double density = (double)(ones_a + ones_b) / num_rows;
-
     ThreadPool thread_pool(num_threads, 100'000 * num_threads);
-    sdsl::bit_vector buffer;
-    sdsl::bit_vector *buf_ptr = nullptr;
-    if (density > 0.5) {
-        buffer = sdsl::bit_vector(num_rows, 0);
-        buf_ptr = &buffer;
-    }
 
-    std::vector<BRWT> children;
-    children.push_back(std::move(tree_a));
-    children.push_back(std::move(tree_b));
+    BRWT merged_root;
 
-    BRWT merged_root = concatenate(std::move(children), buf_ptr, thread_pool, "");
+    // Construct the assignments partition mapping: A's columns followed by B's columns
+    Partition part;
+    part.push_back(utils::arange<uint64_t>(0, tree_a.num_columns()));
+    part.push_back(utils::arange<uint64_t>(tree_a.num_columns(), tree_b.num_columns()));
+    merged_root.assignments_ = RangePartition(std::move(part));
 
-    // The final .brwt format uses bit_vector_smallrank for the root union bv.
+    // Construct union bit vector
+    sdsl::bit_vector union_bv(num_rows, 0);
+    tree_a.nonzero_rows_->add_to(&union_bv);
+    tree_b.nonzero_rows_->add_to(&union_bv);
+
+    merged_root.nonzero_rows_ = std::make_unique<bit_vector_smart>(union_bv);
+    bit_vector_stat ref_bv(union_bv);
+
+    // Compute the sub-indices for child root nodes A and B
+    sdsl::bit_vector subindex_a = generate_subindex(*tree_a.nonzero_rows_, ref_bv, thread_pool);
+    sdsl::bit_vector subindex_b = generate_subindex(*tree_b.nonzero_rows_, ref_bv, thread_pool);
+
+    bit_vector_smallrank new_nonzero_rows_a(std::move(subindex_a));
+    bit_vector_smallrank new_nonzero_rows_b(std::move(subindex_b));
+
+    // Convert root nonzero_rows_ to bit_vector_smallrank (standard final format)
     merged_root.nonzero_rows_ = std::make_unique<bit_vector_smallrank>(
         merged_root.nonzero_rows_->convert_to<bit_vector_smallrank>());
 
@@ -1184,8 +1214,37 @@ void BRWTBottomUpBuilder::merge(const std::filesystem::path &brwt_a,
     std::ofstream out(out_brwt, std::ios::binary);
     if (!out.is_open())
         throw std::runtime_error("merge: cannot open output: " + out_brwt.string());
-    merged_root.serialize(out);
-    logger->info("[merge] Done. Merged index has {} columns.", merged_root.num_columns());
+
+    // 1. Serialize merged_root header
+    merged_root.assignments_.serialize(out);
+    merged_root.nonzero_rows_->serialize(out);
+    serialize_number(out, 2); // 2 children: A and B
+
+    // 2. Serialize Child A (Root metadata + raw subtree copy)
+    tree_a.assignments_.serialize(out);
+    new_nonzero_rows_a.serialize(out);
+    serialize_number(out, num_child_nodes_a);
+    {
+        std::ifstream file_a(brwt_a, std::ios::binary);
+        if (!file_a.is_open())
+            throw std::runtime_error("merge: cannot open BRWT A for copying");
+        file_a.seekg(subtree_offset_a);
+        out << file_a.rdbuf();
+    }
+
+    // 3. Serialize Child B (Root metadata + raw subtree copy)
+    tree_b.assignments_.serialize(out);
+    new_nonzero_rows_b.serialize(out);
+    serialize_number(out, num_child_nodes_b);
+    {
+        std::ifstream file_b(brwt_b, std::ios::binary);
+        if (!file_b.is_open())
+            throw std::runtime_error("merge: cannot open BRWT B for copying");
+        file_b.seekg(subtree_offset_b);
+        out << file_b.rdbuf();
+    }
+
+    logger->info("[merge] Done. Merged index has {} columns.", tree_a.num_columns() + tree_b.num_columns());
 }
 
 // ─── merge_nodes (node-folder format) ────────────────────────────────────────
@@ -1402,64 +1461,100 @@ void BRWTBottomUpBuilder::merge_nodes(const std::filesystem::path &linkage_a_pat
 void BRWTOptimizer::relax(BRWT *brwt_matrix, uint64_t max_arity, size_t num_threads) {
     assert(brwt_matrix);
 
-    // BFT collects internal nodes in BFS order; push_front gives bottom-up (deepest first).
-    std::deque<BRWT*> parents;
-    brwt_matrix->BFT([&](const BRWT &node) {
-        if (node.child_nodes_.size())
-            parents.push_front(const_cast<BRWT*>(&node));
-    });
+    // -----------------------------------------------------------------------
+    // Phase 1: BFS to collect internal nodes grouped by depth level.
+    //
+    // Nodes at the same BFS depth are guaranteed to be in independent subtrees
+    // (no node at depth d can be an ancestor of another node at depth d in a
+    // tree). This means we can safely process all nodes at the same level in
+    // parallel — their child_nodes_ vectors are completely disjoint in memory.
+    // -----------------------------------------------------------------------
+    std::vector<std::vector<BRWT*>> levels;   // levels[0] = root level
 
-    size_t total_internal = parents.size();
+    {
+        std::queue<std::pair<BRWT*, size_t>> q;   // (node, depth)
+        q.push({brwt_matrix, 0});
+
+        while (!q.empty()) {
+            auto [node, depth] = q.front();
+            q.pop();
+
+            if (!node->child_nodes_.empty()) {
+                if (depth >= levels.size())
+                    levels.resize(depth + 1);
+                levels[depth].push_back(node);
+            }
+
+            for (const auto &child : node->child_nodes_) {
+                auto *brwt_child = dynamic_cast<BRWT*>(child.get());
+                if (brwt_child)
+                    q.push({brwt_child, depth + 1});
+            }
+        }
+    }
+
+    size_t total_internal = 0;
+    for (auto &lv : levels) total_internal += lv.size();
+
     logger->info("[relax] Tree loaded: {} columns, {} rows, {} internal nodes, "
-                 "max_arity limit {}",
+                 "max_arity limit {}, {} depth levels, {} threads",
                  brwt_matrix->num_columns(), brwt_matrix->num_rows(),
-                 total_internal, max_arity);
+                 total_internal, max_arity, levels.size(), num_threads);
 
     ProgressBar progress_bar(total_internal, "Relax Multi-BRWT",
                              std::cerr, !common::get_verbose());
 
-    size_t nodes_processed = 0;
-    size_t nodes_pruned    = 0;
-    int    last_pct        = 0;
-    auto   t_start         = std::chrono::high_resolution_clock::now();
+    std::atomic<size_t> nodes_processed{0};
+    std::atomic<size_t> nodes_pruned{0};
+    std::atomic<int>    last_pct{0};
+    auto t_start = std::chrono::high_resolution_clock::now();
 
-    for (BRWT *parent : parents) {
-        size_t arity_before = parent->child_nodes_.size();
+    // -----------------------------------------------------------------------
+    // Phase 2: Process levels bottom-up (deepest first).
+    //
+    // Within each level all nodes are independent → parallelize with OMP.
+    // We pass num_threads=1 to reassign() so it doesn't internally spawn
+    // more threads while the outer parallel region is already running.
+    // -----------------------------------------------------------------------
+    for (int lv = (int)levels.size() - 1; lv >= 0; --lv) {
+        auto &level_nodes = levels[lv];
 
-        for (int g = (int)parent->child_nodes_.size() - 1; g >= 0; --g) {
-            const auto *node = dynamic_cast<const BRWT*>(parent->child_nodes_[g].get());
-            if (node && should_prune(*node)
-                     && parent->child_nodes_.size() - 1
-                            + node->child_nodes_.size() <= max_arity) {
-                size_t child_arity = node->child_nodes_.size();
-                reassign(g, parent, num_threads);
-                // logger->info("[relax] Pruned child (slot {}) under parent "
-                //              "| parent arity {} → {} (child had {} children)",
-                //              g, arity_before,
-                //              parent->child_nodes_.size(), child_arity);
-                ++nodes_pruned;
-                // arity_before tracks the initial arity for logging consecutive prunes
-                arity_before = parent->child_nodes_.size();
+        #pragma omp parallel for num_threads(num_threads) schedule(dynamic)
+        for (size_t i = 0; i < level_nodes.size(); ++i) {
+            BRWT *parent = level_nodes[i];
+
+            // Scan children right-to-left (erasing slots shifts indices, so
+            // scanning from the back keeps indices stable after each erase).
+            for (int g = (int)parent->child_nodes_.size() - 1; g >= 0; --g) {
+                const auto *node = dynamic_cast<const BRWT*>(parent->child_nodes_[g].get());
+                if (node && should_prune(*node)
+                         && parent->child_nodes_.size() - 1
+                                + node->child_nodes_.size() <= max_arity) {
+                    reassign(g, parent, 1);   // 1: outer OMP handles parallelism
+                    nodes_pruned.fetch_add(1, std::memory_order_relaxed);
+                }
             }
-        }
 
-        ++progress_bar;
-        ++nodes_processed;
+            ++progress_bar;
+            size_t done = nodes_processed.fetch_add(1, std::memory_order_relaxed) + 1;
 
-        // Progress milestone every 5% (only when ≥ 20 internal nodes)
-        if (total_internal >= 20) {
-            int pct       = (int)((nodes_processed * 100) / total_internal);
-            int milestone = (pct / 5) * 5;
-            if (milestone > last_pct && milestone < 100) {
-                last_pct = milestone;
-                auto now     = std::chrono::high_resolution_clock::now();
-                double elapsed = std::chrono::duration<double>(now - t_start).count();
-                double frac    = (double)nodes_processed / total_internal;
-                double eta     = elapsed / frac * (1.0 - frac);
-                logger->info("[relax] {}% ({}/{} nodes) | pruned so far: {} | "
-                             "elapsed: {:.1f}s | ETA: {:.1f}s",
-                             milestone, nodes_processed, total_internal,
-                             nodes_pruned, elapsed, eta);
+            if (total_internal >= 20) {
+                int pct       = (int)((done * 100) / total_internal);
+                int milestone = (pct / 5) * 5;
+                int prev = last_pct.load(std::memory_order_relaxed);
+                if (milestone > prev && milestone < 100
+                        && last_pct.compare_exchange_weak(prev, milestone,
+                                std::memory_order_relaxed)) {
+                    auto now = std::chrono::high_resolution_clock::now();
+                    double elapsed = std::chrono::duration<double>(now - t_start).count();
+                    double frac    = (double)done / total_internal;
+                    double eta     = elapsed / frac * (1.0 - frac);
+                    logger->info("[relax] {}% ({}/{} nodes) | pruned so far: {} | "
+                                 "elapsed: {:.1f}s | ETA: {:.1f}s",
+                                 milestone, done, total_internal,
+                                 nodes_pruned.load(std::memory_order_relaxed),
+                                 elapsed, eta);
+                }
             }
         }
     }
@@ -1468,9 +1563,12 @@ void BRWTOptimizer::relax(BRWT *brwt_matrix, uint64_t max_arity, size_t num_thre
     double total_sec = std::chrono::duration<double>(t_end - t_start).count();
     logger->info("[relax] Done. Processed {} internal nodes, pruned {} nodes "
                  "in {:.1f}s. Final columns: {}, rows: {}.",
-                 total_internal, nodes_pruned, total_sec,
+                 total_internal,
+                 nodes_pruned.load(),
+                 total_sec,
                  brwt_matrix->num_columns(), brwt_matrix->num_rows());
 }
+
 
 
 void BRWTOptimizer::relax_nodes(std::vector<std::vector<uint64_t>> &linkage,

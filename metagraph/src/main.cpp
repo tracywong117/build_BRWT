@@ -18,6 +18,8 @@
 #include "annotation/binary_matrix/multi_brwt/brwt_builders.hpp"
 #include "annotation/binary_matrix/multi_brwt/brwt.hpp"
 #include "annotation/binary_matrix/multi_brwt/clustering.hpp"
+#include "cli/build_mmap_index.hpp"
+#include "cli/mmap_brwt_engine.hpp"
 #include "common/logger.hpp"
 #include "common/utils/file_utils.hpp"
 #include "common/serialization.hpp"
@@ -372,19 +374,39 @@ void handle_build(const std::string& annotation_dir, const std::string& prefix, 
 }
 
 void handle_relax(const std::string& input_file, uint64_t max_arity, size_t num_threads, const std::string& output_file) {
+    auto t0 = std::chrono::high_resolution_clock::now();
+
     std::ifstream in(input_file, std::ios::binary);
     if (!in.is_open()) throw std::runtime_error("Failed to open " + input_file);
+
+    logger->info("[relax] Loading BRWT from {} ...", input_file);
     BRWT brwt;
     if (!brwt.load(in)) throw std::runtime_error("Failed to load BRWT from " + input_file);
-    
-    logger->info("Relaxing BRWT (Max Arity: {})...", max_arity);
+    in.close();
+
+    auto t1 = std::chrono::high_resolution_clock::now();
+    logger->info("[relax] Load done in {:.1f}s. Relaxing BRWT (Max Arity: {})...",
+                 std::chrono::duration<double>(t1 - t0).count(), max_arity);
+
     BRWTOptimizer::relax(&brwt, max_arity, num_threads);
-    
-    std::ofstream out(output_file, std::ios::binary);
-    if (!out.is_open()) throw std::runtime_error("Failed to open " + output_file);
-    brwt.serialize(out);
-    logger->info("Relaxed BRWT written to {}", output_file);
+
+    auto t2 = std::chrono::high_resolution_clock::now();
+    logger->info("[relax] Relax done in {:.1f}s. Writing output to {} ...",
+                 std::chrono::duration<double>(t2 - t1).count(), output_file);
+
+    {
+        std::ofstream out(output_file, std::ios::binary);
+        if (!out.is_open()) throw std::runtime_error("Failed to open " + output_file);
+        brwt.serialize(out);
+        out.flush();   // flush to OS buffer
+    }  // destructor closes + syncs to disk here — this is the slow part
+
+    auto t3 = std::chrono::high_resolution_clock::now();
+    logger->info("[relax] Write+flush done in {:.1f}s. Total: {:.1f}s.",
+                 std::chrono::duration<double>(t3 - t2).count(),
+                 std::chrono::duration<double>(t3 - t0).count());
 }
+
 
 void handle_relax_nodes(const std::string& linkage_file, const std::string& node_dir, uint64_t max_arity, const std::string& output_linkage, size_t num_threads) {
     logger->info("Parsing linkage matrix from: {}", linkage_file);
@@ -402,6 +424,69 @@ void handle_relax_nodes(const std::string& linkage_file, const std::string& node
         out << "\n";
     }
     logger->info("Relaxation complete.");
+}
+
+void handle_server_mmap(const std::string& brwt_f, const std::string& cols_f, const std::string& idx_f, uint16_t port) {
+    logger->info("Building global topology from {}...", idx_f);
+    mtg::cli::MmapNode root = mtg::cli::build_global_topology(idx_f, brwt_f);
+    
+    logger->info("Initializing EnginePool...");
+    auto engine_pool = std::make_shared<mtg::cli::EnginePool>(brwt_f, root);
+    
+    logger->info("Loading column names from {}...", cols_f);
+    auto names = std::make_shared<std::vector<std::pair<uint64_t, std::string>>>(deserialize_column_names(cols_f));
+
+    HttpServer server;
+    server.config.port = port;
+    server.config.thread_pool_size = std::thread::hardware_concurrency();
+
+    server.resource["^/query$"]["POST"] = [engine_pool, names](auto resp, auto req) {
+        try {
+            std::string body = req->content.string();
+            Json::Value req_json;
+            Json::CharReaderBuilder builder;
+            std::string errs;
+            std::unique_ptr<Json::CharReader> reader(builder.newCharReader());
+            
+            if (!reader->parse(body.data(), body.data() + body.size(), &req_json, &errs)) {
+                throw std::runtime_error("JSON parse error: " + errs);
+            }
+
+            if (!req_json.isMember("row_ids") || !req_json["row_ids"].isArray()) {
+                throw std::runtime_error("Request must contain 'row_ids' array.");
+            }
+            
+            std::vector<uint64_t> ids;
+            for (const auto& id_val : req_json["row_ids"]) {
+                ids.push_back(id_val.asUInt64());
+            }
+            
+            auto engine = engine_pool->acquire();
+            auto results = engine->get_rows(ids);
+            engine_pool->release(engine);
+            
+            Json::Value resp_json(Json::objectValue);
+            for (size_t i = 0; i < ids.size(); ++i) {
+                Json::Value row_res(Json::arrayValue);
+                for (auto bit : results[i]) {
+                    auto it = std::find_if(names->begin(), names->end(), 
+                                           [&](auto& p){ return p.first == bit.first; });
+                    if (it != names->end()) row_res.append(it->second);
+                }
+                resp_json[std::to_string(ids[i])] = row_res;
+            }
+            
+            std::string out = Json::writeString(Json::StreamWriterBuilder(), resp_json);
+            *resp << "HTTP/1.1 200 OK\r\nContent-Length: " << out.size() << "\r\n\r\n" << out;
+            
+        } catch (const std::exception& e) {
+            std::string msg = std::string("Error: ") + e.what();
+            *resp << "HTTP/1.1 400 Bad Request\r\nContent-Length: " << msg.size() << "\r\n\r\n" << msg;
+        }
+    };
+
+    logger->info("Mmap Server started on http://localhost:{}", port);
+    server.start();
 }
 
 void handle_server(const std::string& brwt_f, const std::string& cols_f, uint16_t port) {
@@ -732,6 +817,10 @@ void show_usage(const std::string& program_name) {
               << "  root-append-nodes <linkageFile> <nodeDir> <targetLen>\n"
               << "      Extend a node-folder BRWT matrix to targetLen rows by appending zeros.\n"
               << "      Backs up original root as ori_node_<root_id>; overwrites <root_id>.\n\n"
+              << "  build-mmap-index <inputFile.brwt> <outputFile.brwt.idx> [--output-log <logFile>]\n"
+              << "      Generate a sidecar index for O(1) random access to BRWT nodes.\n\n"
+              << "  server-mmap <brwtFile> <columnsFile> <indexFile> [--port <P>]\n"
+              << "      Start a REST API server for row queries using an mmap index.\n\n"
               << "  server <brwtFile> <columnsFile> [--port <P>]\n"
               << "      Start a REST API server for row queries.\n\n"
               << "  benchmark <brwtFile> <columnsFile>\n"
@@ -876,6 +965,26 @@ int main(int argc, char* argv[]) {
             // root-append-nodes <linkageFile> <nodeDir> <targetLen>
             if (argc < 5) { show_usage(argv[0]); return 1; }
             handle_root_append_nodes(argv[2], argv[3], std::stoull(argv[4]));
+        } else if (cmd == "build-mmap-index") {
+            if (argc < 4) { show_usage(argv[0]); return 1; }
+            std::string log_file = "";
+            if (argc >= 6 && std::string(argv[4]) == "--output-log") {
+                log_file = argv[5];
+            }
+            mtg::cli::handle_build_mmap_index(argv[2], argv[3], log_file);
+        } else if (cmd == "server-mmap") {
+            if (argc < 5) {
+                show_usage(argv[0]);
+                return 1;
+            }
+            std::string brwt_f = argv[2];
+            std::string cols_f = argv[3];
+            std::string idx_f = argv[4];
+            uint16_t port = 8080;
+            for(int i=5; i<argc; ++i) {
+                if (std::string(argv[i]) == "--port" && i+1 < argc) port = std::stoul(argv[++i]);
+            }
+            handle_server_mmap(brwt_f, cols_f, idx_f, port);
         } else if (cmd == "server") {
             if (argc < 4) {
                 show_usage(argv[0]);

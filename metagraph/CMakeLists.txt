@@ -312,7 +312,6 @@ target_link_libraries(metagraph-cli PUBLIC metagraph-core simple-web-server)
 target_link_libraries(metagraph metagraph-core metagraph-cli)
 
 
-
 # Install
 file(GLOB_RECURSE header_files "${SRC_DIR}/*.hpp")
 install(TARGETS metagraph-core DESTINATION lib)
